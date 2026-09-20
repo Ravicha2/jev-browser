@@ -327,9 +327,27 @@ async function observe() {
   }
 }
 
+// The round's token totals and the model that answered. The trail is only the
+// last ten steps, which is enough to read a round back but not to count it, and
+// M1 (#4) has to count what a task spent and know which version answered before
+// it can pin one.
+const usageTotal = { requests: 0 }
+let modelSeen = null
+
+function tally(response) {
+  usageTotal.requests += 1
+  modelSeen = response.model ?? modelSeen
+  for (const [key, value] of Object.entries(response.usage ?? {})) {
+    if (typeof value === 'number') usageTotal[key] = (usageTotal[key] ?? 0) + value
+  }
+}
+
 function exitObject({ status, reason, detail, step, steps, state, extra = {} }) {
   const base = {
     status,
+    usage_total: usageTotal,
+    step_count: steps ?? step ?? 0,
+    ...(modelSeen ? { model: modelSeen } : {}),
     ...(reason ? { reason } : {}),
     ...(detail ? { detail } : {}),
     ...(step ? { step } : {}),
@@ -414,6 +432,7 @@ async function main() {
     const startedAt = Date.now()
     const response = await ask({ model: MODEL, state, questions }, key)
     const latencyMs = Date.now() - startedAt
+    tally(response)
 
     const decision = readDecision({ response, candidates, retried })
     const record = {

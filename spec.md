@@ -71,6 +71,9 @@ Everything below was checked against the live docs and the local environment, no
 | Lifecycle | `useOrCreateTaskSpace(name)`, `handOffTaskSpace()`, `takeOverTaskSpace()`, `completeTaskSpace(name, {keep})` |
 | Output | `cliLog(value)` is the only output channel and it writes to **stderr**, not stdout, so a caller that redirects stdout captures nothing. The last call is the script's return value. |
 | Refs | `@N` refs are valid only for the most recent `snapshotText()` call |
+| State across rounds | One long-lived process, one **fresh script scope** per heredoc. Verified: two invocations report the same `process.pid`, and `globalThis` resets (a counter set to 1 is still 1 on the next call), while the page keeps its URL, its scroll position, and its own globals. So nothing you declare carries over, and the task space is the handle to what does. |
+| Scrolling | `js('window.scrollTo(0, y)')` is precise and `scrollToBottomUntil()` is bulk, both verified. `scroll(n)` advances about 300px whatever `n` says, and `scrollBy` does nothing. `pageInfo().sy` matches `window.scrollY`. |
+| Also available | `snapshot()`, `snapshotRaw()`, `elementCenter(ref)` returning `{x, y}` with a negative y above the viewport, `hover`, `captureScreenshot` (a path, not image data), `waitForElement`, `waitForLoad`, `waitForNetworkIdle`, `currentTab`, `listTabs`. `dispatchKey` takes a target then a key. There is no `select`. |
 
 **Cost consequence.** A 2k-token step is about $0.00008. A 20-step browse is about $0.002.
 A thousand such tasks is under two dollars. Cost is not a design constraint here; build time

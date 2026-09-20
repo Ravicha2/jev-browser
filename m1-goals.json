@@ -1,0 +1,17 @@
+{
+  "start_url": "https://nodejs.org/docs/latest/api/",
+  "step_budget": 12,
+  "note": "M1 (#4) input. Each goal is a single fact that lives on a page you must navigate to from the API index, so every task is a real multi-hop collection rather than a single-page lookup. Every answer below was confirmed present on a reachable page in the live docs, so a `done` can be checked rather than trusted. Goals 5 and 7 were reworded after the first run: both presupposed text the docs do not contain (that cluster decides its own worker count, and that the page names an error code for maxBuffer), which would have made those two tasks unanswerable rather than merely hard.",
+  "goals": [
+    "Find the default host and port that the Node.js inspector listens on when the process is started with the --inspect flag.",
+    "Find the Node.js version in which the node:sqlite module was added, and its current stability level.",
+    "Find which CLI flag controls TypeScript type stripping, and the flag name it replaced in v25.2.0 and v24.12.0.",
+    "Find the two operational modes of the Node.js Permission Model and say which one is the default when --permission is passed.",
+    "Find what the cluster module's documentation example uses to decide how many workers to fork, and the module that function is imported from.",
+    "Find the name of the class that node:sqlite exposes for a synchronous SQLite database connection.",
+    "Find what the maxBuffer option of child_process.exec() limits, what happens when it is exceeded, and its default value.",
+    "Find whether the Node.js test runner can run in watch mode, and the Node.js versions that gained that support.",
+    "Find what the File System Permissions section says the Permission Model restricts by default, and which module it names as outside that guarantee.",
+    "Find the Node.js version that first shipped the --inspect-wait flag."
+  ]
+}
