@@ -482,8 +482,11 @@ converges and one that spins.
    `/`, so absolute paths are mandatory. See Configuration.
 2. What does the goal string from Claude Code look like in practice, and how structured should
    it be? A free sentence versus `{task, target, fields}` changes the questions.
-3. Real page fingerprint cost. Hashing the candidate list is cheap, but confirm it is stable
-   across a harmless re-render, or the ping-pong guard never fires.
+3. ~~Real page fingerprint cost.~~ **Resolved.** Hashing the pruned candidate list is cheap and
+   stable, but only if the hash is *ref-free*: `@N` refs are CDP backend node ids, so a
+   re-render can renumber them and the guard would never fire. The fingerprint is
+   `sha256(url + label|count pairs)`, and `scripts/prune.js` checks that a re-render with every
+   ref renumbered hashes identically.
 4. `serverFetch`'s exact return shape is not documented clearly enough to rely on. Use global
    `fetch` for the TypeSafe call, which is confirmed present.
 5. ~~When packaged as a skill, does Claude Code reliably pass the absolute skill root into the

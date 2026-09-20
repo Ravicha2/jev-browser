@@ -1,0 +1,307 @@
+root
+  heading
+    text "Acme Retail Demo Store"
+  form
+    text "VAT number"
+    textbox [ref=20, loc=css:input[name="vat"]]
+    button [ref=21, loc=css:input[type="submit"]]
+      text "Submit"
+    button [ref=22, loc=unstable]
+      text "Buy now"
+    anchor [ref=23, loc=href:/send, url=https://shop.example.com/send]
+      text "Send"
+    anchor [ref=24, loc=href:/unsubscribe, url=https://shop.example.com/unsubscribe]
+      text "Unsubscribe from all emails"
+    anchor [ref=25, loc=href:/help, url=https://shop.example.com/help]
+      text "Help"
+    button [ref=26, loc=unstable]
+    anchor [ref=27, loc=href:/r/1, url=https://shop.example.com/r/1]
+      text "Read more"
+    anchor [ref=28, loc=href:/r/2, url=https://shop.example.com/r/2]
+      text "Read more"
+    anchor [ref=29, loc=href:/privacy, url=https://shop.example.com/privacy]
+      text "Read the full privacy policy and cookie notice for details about how we process personal data, advertising identifiers, and retention periods across all of our regional storefronts and partners."
+    textbox [ref=31, loc=css:input[name="q"]]
+    button [ref=30, loc=unstable]
+      text "Far away button"
+  container
+    anchor [ref=101, loc=href:/result/1, url=https://shop.example.com/result/1]
+      text "Result 1"
+    anchor [ref=102, loc=href:/result/2, url=https://shop.example.com/result/2]
+      text "Result 2"
+    anchor [ref=103, loc=href:/result/3, url=https://shop.example.com/result/3]
+      text "Result 3"
+    anchor [ref=104, loc=href:/result/4, url=https://shop.example.com/result/4]
+      text "Result 4"
+    anchor [ref=105, loc=href:/result/5, url=https://shop.example.com/result/5]
+      text "Result 5"
+    anchor [ref=106, loc=href:/result/6, url=https://shop.example.com/result/6]
+      text "Result 6"
+    anchor [ref=107, loc=href:/result/7, url=https://shop.example.com/result/7]
+      text "Result 7"
+    anchor [ref=108, loc=href:/result/8, url=https://shop.example.com/result/8]
+      text "Result 8"
+    anchor [ref=109, loc=href:/result/9, url=https://shop.example.com/result/9]
+      text "Result 9"
+    anchor [ref=110, loc=href:/result/10, url=https://shop.example.com/result/10]
+      text "Result 10"
+    anchor [ref=111, loc=href:/result/11, url=https://shop.example.com/result/11]
+      text "Result 11"
+    anchor [ref=112, loc=href:/result/12, url=https://shop.example.com/result/12]
+      text "Result 12"
+    anchor [ref=113, loc=href:/result/13, url=https://shop.example.com/result/13]
+      text "Result 13"
+    anchor [ref=114, loc=href:/result/14, url=https://shop.example.com/result/14]
+      text "Result 14"
+    anchor [ref=115, loc=href:/result/15, url=https://shop.example.com/result/15]
+      text "Result 15"
+    anchor [ref=116, loc=href:/result/16, url=https://shop.example.com/result/16]
+      text "Result 16"
+    anchor [ref=117, loc=href:/result/17, url=https://shop.example.com/result/17]
+      text "Result 17"
+    anchor [ref=118, loc=href:/result/18, url=https://shop.example.com/result/18]
+      text "Result 18"
+    anchor [ref=119, loc=href:/result/19, url=https://shop.example.com/result/19]
+      text "Result 19"
+    anchor [ref=120, loc=href:/result/20, url=https://shop.example.com/result/20]
+      text "Result 20"
+    anchor [ref=121, loc=href:/result/21, url=https://shop.example.com/result/21]
+      text "Result 21"
+    anchor [ref=122, loc=href:/result/22, url=https://shop.example.com/result/22]
+      text "Result 22"
+    anchor [ref=123, loc=href:/result/23, url=https://shop.example.com/result/23]
+      text "Result 23"
+    anchor [ref=124, loc=href:/result/24, url=https://shop.example.com/result/24]
+      text "Result 24"
+    anchor [ref=125, loc=href:/result/25, url=https://shop.example.com/result/25]
+      text "Result 25"
+    anchor [ref=126, loc=href:/result/26, url=https://shop.example.com/result/26]
+      text "Result 26"
+    anchor [ref=127, loc=href:/result/27, url=https://shop.example.com/result/27]
+      text "Result 27"
+    anchor [ref=128, loc=href:/result/28, url=https://shop.example.com/result/28]
+      text "Result 28"
+    anchor [ref=129, loc=href:/result/29, url=https://shop.example.com/result/29]
+      text "Result 29"
+    anchor [ref=130, loc=href:/result/30, url=https://shop.example.com/result/30]
+      text "Result 30"
+    anchor [ref=131, loc=href:/result/31, url=https://shop.example.com/result/31]
+      text "Result 31"
+    anchor [ref=132, loc=href:/result/32, url=https://shop.example.com/result/32]
+      text "Result 32"
+    anchor [ref=133, loc=href:/result/33, url=https://shop.example.com/result/33]
+      text "Result 33"
+    anchor [ref=134, loc=href:/result/34, url=https://shop.example.com/result/34]
+      text "Result 34"
+    anchor [ref=135, loc=href:/result/35, url=https://shop.example.com/result/35]
+      text "Result 35"
+    anchor [ref=136, loc=href:/result/36, url=https://shop.example.com/result/36]
+      text "Result 36"
+    anchor [ref=137, loc=href:/result/37, url=https://shop.example.com/result/37]
+      text "Result 37"
+    anchor [ref=138, loc=href:/result/38, url=https://shop.example.com/result/38]
+      text "Result 38"
+    anchor [ref=139, loc=href:/result/39, url=https://shop.example.com/result/39]
+      text "Result 39"
+    anchor [ref=140, loc=href:/result/40, url=https://shop.example.com/result/40]
+      text "Result 40"
+    anchor [ref=141, loc=href:/result/41, url=https://shop.example.com/result/41]
+      text "Result 41"
+    anchor [ref=142, loc=href:/result/42, url=https://shop.example.com/result/42]
+      text "Result 42"
+    anchor [ref=143, loc=href:/result/43, url=https://shop.example.com/result/43]
+      text "Result 43"
+    anchor [ref=144, loc=href:/result/44, url=https://shop.example.com/result/44]
+      text "Result 44"
+    anchor [ref=145, loc=href:/result/45, url=https://shop.example.com/result/45]
+      text "Result 45"
+    anchor [ref=146, loc=href:/result/46, url=https://shop.example.com/result/46]
+      text "Result 46"
+    anchor [ref=147, loc=href:/result/47, url=https://shop.example.com/result/47]
+      text "Result 47"
+    anchor [ref=148, loc=href:/result/48, url=https://shop.example.com/result/48]
+      text "Result 48"
+    anchor [ref=149, loc=href:/result/49, url=https://shop.example.com/result/49]
+      text "Result 49"
+    anchor [ref=150, loc=href:/result/50, url=https://shop.example.com/result/50]
+      text "Result 50"
+    anchor [ref=151, loc=href:/result/51, url=https://shop.example.com/result/51]
+      text "Result 51"
+    anchor [ref=152, loc=href:/result/52, url=https://shop.example.com/result/52]
+      text "Result 52"
+    anchor [ref=153, loc=href:/result/53, url=https://shop.example.com/result/53]
+      text "Result 53"
+    anchor [ref=154, loc=href:/result/54, url=https://shop.example.com/result/54]
+      text "Result 54"
+    anchor [ref=155, loc=href:/result/55, url=https://shop.example.com/result/55]
+      text "Result 55"
+    anchor [ref=156, loc=href:/result/56, url=https://shop.example.com/result/56]
+      text "Result 56"
+    anchor [ref=157, loc=href:/result/57, url=https://shop.example.com/result/57]
+      text "Result 57"
+    anchor [ref=158, loc=href:/result/58, url=https://shop.example.com/result/58]
+      text "Result 58"
+    anchor [ref=159, loc=href:/result/59, url=https://shop.example.com/result/59]
+      text "Result 59"
+    anchor [ref=160, loc=href:/result/60, url=https://shop.example.com/result/60]
+      text "Result 60"
+    anchor [ref=161, loc=href:/result/61, url=https://shop.example.com/result/61]
+      text "Result 61"
+    anchor [ref=162, loc=href:/result/62, url=https://shop.example.com/result/62]
+      text "Result 62"
+    anchor [ref=163, loc=href:/result/63, url=https://shop.example.com/result/63]
+      text "Result 63"
+    anchor [ref=164, loc=href:/result/64, url=https://shop.example.com/result/64]
+      text "Result 64"
+    anchor [ref=165, loc=href:/result/65, url=https://shop.example.com/result/65]
+      text "Result 65"
+    anchor [ref=166, loc=href:/result/66, url=https://shop.example.com/result/66]
+      text "Result 66"
+    anchor [ref=167, loc=href:/result/67, url=https://shop.example.com/result/67]
+      text "Result 67"
+    anchor [ref=168, loc=href:/result/68, url=https://shop.example.com/result/68]
+      text "Result 68"
+    anchor [ref=169, loc=href:/result/69, url=https://shop.example.com/result/69]
+      text "Result 69"
+    anchor [ref=170, loc=href:/result/70, url=https://shop.example.com/result/70]
+      text "Result 70"
+    anchor [ref=171, loc=href:/result/71, url=https://shop.example.com/result/71]
+      text "Result 71"
+    anchor [ref=172, loc=href:/result/72, url=https://shop.example.com/result/72]
+      text "Result 72"
+    anchor [ref=173, loc=href:/result/73, url=https://shop.example.com/result/73]
+      text "Result 73"
+    anchor [ref=174, loc=href:/result/74, url=https://shop.example.com/result/74]
+      text "Result 74"
+    anchor [ref=175, loc=href:/result/75, url=https://shop.example.com/result/75]
+      text "Result 75"
+    anchor [ref=176, loc=href:/result/76, url=https://shop.example.com/result/76]
+      text "Result 76"
+    anchor [ref=177, loc=href:/result/77, url=https://shop.example.com/result/77]
+      text "Result 77"
+    anchor [ref=178, loc=href:/result/78, url=https://shop.example.com/result/78]
+      text "Result 78"
+    anchor [ref=179, loc=href:/result/79, url=https://shop.example.com/result/79]
+      text "Result 79"
+    anchor [ref=180, loc=href:/result/80, url=https://shop.example.com/result/80]
+      text "Result 80"
+    anchor [ref=181, loc=href:/result/81, url=https://shop.example.com/result/81]
+      text "Result 81"
+    anchor [ref=182, loc=href:/result/82, url=https://shop.example.com/result/82]
+      text "Result 82"
+    anchor [ref=183, loc=href:/result/83, url=https://shop.example.com/result/83]
+      text "Result 83"
+    anchor [ref=184, loc=href:/result/84, url=https://shop.example.com/result/84]
+      text "Result 84"
+    anchor [ref=185, loc=href:/result/85, url=https://shop.example.com/result/85]
+      text "Result 85"
+    anchor [ref=186, loc=href:/result/86, url=https://shop.example.com/result/86]
+      text "Result 86"
+    anchor [ref=187, loc=href:/result/87, url=https://shop.example.com/result/87]
+      text "Result 87"
+    anchor [ref=188, loc=href:/result/88, url=https://shop.example.com/result/88]
+      text "Result 88"
+    anchor [ref=189, loc=href:/result/89, url=https://shop.example.com/result/89]
+      text "Result 89"
+    anchor [ref=190, loc=href:/result/90, url=https://shop.example.com/result/90]
+      text "Result 90"
+    anchor [ref=191, loc=href:/result/91, url=https://shop.example.com/result/91]
+      text "Result 91"
+    anchor [ref=192, loc=href:/result/92, url=https://shop.example.com/result/92]
+      text "Result 92"
+    anchor [ref=193, loc=href:/result/93, url=https://shop.example.com/result/93]
+      text "Result 93"
+    anchor [ref=194, loc=href:/result/94, url=https://shop.example.com/result/94]
+      text "Result 94"
+    anchor [ref=195, loc=href:/result/95, url=https://shop.example.com/result/95]
+      text "Result 95"
+    anchor [ref=196, loc=href:/result/96, url=https://shop.example.com/result/96]
+      text "Result 96"
+    anchor [ref=197, loc=href:/result/97, url=https://shop.example.com/result/97]
+      text "Result 97"
+    anchor [ref=198, loc=href:/result/98, url=https://shop.example.com/result/98]
+      text "Result 98"
+    anchor [ref=199, loc=href:/result/99, url=https://shop.example.com/result/99]
+      text "Result 99"
+    anchor [ref=200, loc=href:/result/100, url=https://shop.example.com/result/100]
+      text "Result 100"
+    anchor [ref=201, loc=href:/result/101, url=https://shop.example.com/result/101]
+      text "Result 101"
+    anchor [ref=202, loc=href:/result/102, url=https://shop.example.com/result/102]
+      text "Result 102"
+    anchor [ref=203, loc=href:/result/103, url=https://shop.example.com/result/103]
+      text "Result 103"
+    anchor [ref=204, loc=href:/result/104, url=https://shop.example.com/result/104]
+      text "Result 104"
+    anchor [ref=205, loc=href:/result/105, url=https://shop.example.com/result/105]
+      text "Result 105"
+    anchor [ref=206, loc=href:/result/106, url=https://shop.example.com/result/106]
+      text "Result 106"
+    anchor [ref=207, loc=href:/result/107, url=https://shop.example.com/result/107]
+      text "Result 107"
+    anchor [ref=208, loc=href:/result/108, url=https://shop.example.com/result/108]
+      text "Result 108"
+    anchor [ref=209, loc=href:/result/109, url=https://shop.example.com/result/109]
+      text "Result 109"
+    anchor [ref=210, loc=href:/result/110, url=https://shop.example.com/result/110]
+      text "Result 110"
+    anchor [ref=211, loc=href:/result/111, url=https://shop.example.com/result/111]
+      text "Result 111"
+    anchor [ref=212, loc=href:/result/112, url=https://shop.example.com/result/112]
+      text "Result 112"
+    anchor [ref=213, loc=href:/result/113, url=https://shop.example.com/result/113]
+      text "Result 113"
+    anchor [ref=214, loc=href:/result/114, url=https://shop.example.com/result/114]
+      text "Result 114"
+    anchor [ref=215, loc=href:/result/115, url=https://shop.example.com/result/115]
+      text "Result 115"
+    anchor [ref=216, loc=href:/result/116, url=https://shop.example.com/result/116]
+      text "Result 116"
+    anchor [ref=217, loc=href:/result/117, url=https://shop.example.com/result/117]
+      text "Result 117"
+    anchor [ref=218, loc=href:/result/118, url=https://shop.example.com/result/118]
+      text "Result 118"
+    anchor [ref=219, loc=href:/result/119, url=https://shop.example.com/result/119]
+      text "Result 119"
+    anchor [ref=220, loc=href:/result/120, url=https://shop.example.com/result/120]
+      text "Result 120"
+    anchor [ref=221, loc=href:/result/121, url=https://shop.example.com/result/121]
+      text "Result 121"
+    anchor [ref=222, loc=href:/result/122, url=https://shop.example.com/result/122]
+      text "Result 122"
+    anchor [ref=223, loc=href:/result/123, url=https://shop.example.com/result/123]
+      text "Result 123"
+    anchor [ref=224, loc=href:/result/124, url=https://shop.example.com/result/124]
+      text "Result 124"
+    anchor [ref=225, loc=href:/result/125, url=https://shop.example.com/result/125]
+      text "Result 125"
+    anchor [ref=226, loc=href:/result/126, url=https://shop.example.com/result/126]
+      text "Result 126"
+    anchor [ref=227, loc=href:/result/127, url=https://shop.example.com/result/127]
+      text "Result 127"
+    anchor [ref=228, loc=href:/result/128, url=https://shop.example.com/result/128]
+      text "Result 128"
+    anchor [ref=229, loc=href:/result/129, url=https://shop.example.com/result/129]
+      text "Result 129"
+    anchor [ref=230, loc=href:/result/130, url=https://shop.example.com/result/130]
+      text "Result 130"
+    anchor [ref=231, loc=href:/result/131, url=https://shop.example.com/result/131]
+      text "Result 131"
+    anchor [ref=232, loc=href:/result/132, url=https://shop.example.com/result/132]
+      text "Result 132"
+    anchor [ref=233, loc=href:/result/133, url=https://shop.example.com/result/133]
+      text "Result 133"
+    anchor [ref=234, loc=href:/result/134, url=https://shop.example.com/result/134]
+      text "Result 134"
+    anchor [ref=235, loc=href:/result/135, url=https://shop.example.com/result/135]
+      text "Result 135"
+    anchor [ref=236, loc=href:/result/136, url=https://shop.example.com/result/136]
+      text "Result 136"
+    anchor [ref=237, loc=href:/result/137, url=https://shop.example.com/result/137]
+      text "Result 137"
+    anchor [ref=238, loc=href:/result/138, url=https://shop.example.com/result/138]
+      text "Result 138"
+    anchor [ref=239, loc=href:/result/139, url=https://shop.example.com/result/139]
+      text "Result 139"
+    anchor [ref=240, loc=href:/result/140, url=https://shop.example.com/result/140]
+      text "Result 140"
