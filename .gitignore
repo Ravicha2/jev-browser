@@ -1,0 +1,7 @@
+# Secrets. Never commit the API key.
+.env
+
+# Per-round job state, can contain user-supplied values.
+job.json
+
+node_modules/
