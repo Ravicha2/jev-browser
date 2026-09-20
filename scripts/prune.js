@@ -83,7 +83,14 @@ export function parseSnapshot(snapshotText) {
 // defaults to full_page and marks nothing for being below the fold. The loop
 // supplies the refs it measured outside the viewport, the fixture supplies them
 // by hand. Empty is a valid answer, not a silent failure.
-export function pruneCandidates(snapshotText, { offscreenRefs = [] } = {}) {
+export function pruneCandidates(snapshotText, options) {
+  return pruneDetail(snapshotText, options).candidates
+}
+
+// The same pipeline, plus how many nodes step 7 removed. The loop needs that
+// number: an empty list means "nothing to click", but an empty list that step 7
+// emptied means "only commit-like controls remain", which is its own exit.
+export function pruneDetail(snapshotText, { offscreenRefs = [] } = {}) {
   const lines = parseSnapshot(snapshotText)
   const offscreen = new Set(offscreenRefs.map(String))
   const kept = []
@@ -125,10 +132,16 @@ export function pruneCandidates(snapshotText, { offscreenRefs = [] } = {}) {
 
   // 5. truncate, 6. cap, 7. remove commit-like controls. Only ref, label and
   // count go to Jev; loc and the raw texts were for matching, not for sending.
-  return [...unique.values()]
-    .slice(0, MAX_CANDIDATES)
-    .filter((candidate) => !isCommitLike(candidate))
-    .map((candidate) => ({ ref: candidate.ref, label: truncate(candidate.label), count: candidate.count }))
+  const capped = [...unique.values()].slice(0, MAX_CANDIDATES)
+  const allowed = capped.filter((candidate) => !isCommitLike(candidate))
+  return {
+    candidates: allowed.map((candidate) => ({
+      ref: candidate.ref,
+      label: truncate(candidate.label),
+      count: candidate.count,
+    })),
+    commitCount: capped.length - allowed.length,
+  }
 }
 
 function truncate(label) {
@@ -169,6 +182,9 @@ async function selfCheck() {
   )
   const candidates = pruneCandidates(snapshot, { offscreenRefs: FIXTURE_OFFSCREEN })
   const labels = candidates.map((candidate) => candidate.label)
+
+  // The loop's empty-list distinction: 4 controls were removed by step 7.
+  assert.equal(pruneDetail(snapshot, { offscreenRefs: FIXTURE_OFFSCREEN }).commitCount, 4)
 
   // Trust boundary: the submit button (an input[type=submit] wearing its text),
   // the "Send" link, the "Buy now" button, the unsubscribe link.

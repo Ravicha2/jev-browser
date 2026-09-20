@@ -180,6 +180,31 @@ One heredoc per round. Loop inside it, print one JSON object, exit.
 Suggested limits: 12 steps for exploratory collection, 20 for form filling. Page load is
 usually the real bottleneck, so do not be stingy with `wait` values.
 
+### Freshness, and consuming the decision
+
+Observed in practice, not designed in the abstract: on a hydrated page, the candidate list
+moves between the snapshot the decision was made from and the moment of the click. So the
+step observes again immediately before acting, and:
+
+- **A moved page is not acted on.** If the fingerprint at act time differs from the one at
+  decision time, the decision is discarded, nothing is clicked, and the loop re-observes and
+  re-asks. A stale ref is a misclick, so this is a safety property, not only an accuracy one.
+  Two discards in a row escalates as `stale_page`.
+- **The ref is read from the act-time snapshot**, at the position Jev chose from, and never
+  carried across steps. `@N` refs belong to the most recent `snapshotText()` and nothing else.
+- **The decision is consumed before any mutation.** The ref is used exactly once, so a click
+  that throws cannot be retried into a double-click.
+- **The action is recorded before the next observation**, so a stale post-action snapshot
+  cannot erase the record of something that did happen.
+
+### Blocked means no progress, not no navigation
+
+Three consecutive actions with no page change ends the round as `no_progress`. That counts
+what matters: a page that changed but did not advance is progress, and an action that changed
+nothing is not. It is tighter than the repeat-page guard, which catches leaving a page and
+coming back to it, and separate from ping-pong, which is about escalating twice on one
+fingerprint across rounds.
+
 ## Candidate pruning
 
 This runs in code before every Jev call. It is both the main accuracy lever and the safety
@@ -286,6 +311,23 @@ anyway.
 Needs_input means "I can proceed, but I need a value I do not have," and it names the value so
 Claude Code's reply is cheap.
 
+The `reason` is the vocabulary Claude Code branches on, and it is closed:
+
+| Reason | Means |
+|---|---|
+| `credentials_required` | Login, captcha, or 2FA. The task space was handed off; tell the user what to do. |
+| `layout_unfamiliar` | A canvas or virtualized editor. Drive ego-browser directly. |
+| `only_commit_remains` | Every candidate was commit-like. Take over, or ask the user. |
+| `cannot_choose`, `low_confidence` | No candidate advances the goal, or the pick stayed shaky after the retry. |
+| `stale_page`, `no_progress`, `repeat_page`, `ping_pong` | The page kept moving under us, or the loop stopped converging. Nothing was collected. |
+| `step_budget` | The budget ran out first. |
+| `invalid_response` | An answer failed validation, so nothing executed. |
+| `error`, `skill_root_not_found` | Our fault, not the page's: read `detail`. |
+
+Every escalate carries `step` and `page_fingerprint`, and the loop adds `goal`, `model`,
+`task_space_id`, and `trail` (the last ten steps with their decisions, latency, and token
+usage) so a round can be read back without a trace file.
+
 ## Where findings live
 
 Three artifacts, because the audiences differ.
@@ -335,28 +377,33 @@ Round N prints `needs_input` and exits. Claude Code answers. Round N+1 re-invoke
 same task space id and the answer merged in. ego-browser supports resuming a space across
 rounds, so page state survives. Nothing is held open.
 
-Both rounds read the same `job.json`, which Claude Code rewrites between them. It lives in a
-scratch directory, and its path is absolute because the heredoc's working directory is not the
-caller's:
+Both rounds read the same `job.json`, which Claude Code rewrites between them. It lives under
+`~/.claude/jev-browser/`, not in a scratch directory the OS reaps, and its path is absolute
+because the heredoc's working directory is not the caller's:
 
 ```json
 {
   "task_space_id": 3,
   "goal": "find the VAT registration number on the account page",
+  "start_url": "https://example.com/account",
   "supplied_values": { "vat_number": "IE1234567X" },
   "step_budget": 12,
-  "visited_fingerprints": ["a1b2c3"]
+  "visited_fingerprints": ["a1b2c3"],
+  "escalated_fingerprints": []
 }
 ```
 
 ```js
-const job = JSON.parse(readFileSync(process.env.TMPDIR + 'jev-browser/job.json', 'utf8'))
+const job = JSON.parse(readFileSync(`${process.env.HOME}/.claude/jev-browser/job.json`, 'utf8'))
 const task = await useOrCreateTaskSpace(job.task_space_id)
 ```
 
-`visited_fingerprints` is carried across rounds so the ping-pong guard still works after a
-resume. Nothing is passed through the shell, so a goal string containing quotes, backticks, or
-newlines cannot break the invocation.
+`visited_fingerprints` is carried across rounds so the repeat-page guard still works after a
+resume, and `escalated_fingerprints` is what the ping-pong guard reads. A round reports the
+fingerprint it escalated on in its exit object; the caller records it when it rewrites
+`job.json`, because the loop never writes the job file it was handed. Nothing is passed through
+the shell, so a goal string containing quotes, backticks, or newlines cannot break the
+invocation.
 
 ## Packaging as a skill
 
