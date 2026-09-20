@@ -1,8 +1,18 @@
-// Candidate pruning (issue #2, spec.md "Candidate pruning").
+// Candidate pruning (issue #2 as reopened, fixed in #10; spec.md "Candidate
+// pruning").
 //
 // Runs in code before every Jev call. It is both the main accuracy lever and the
 // safety control: step 7 removes commit-like controls before Jev ever sees the
 // list, so submitting is unreachable rather than discouraged.
+//
+// M1 (#4) measured the old rule — drop off-viewport nodes — deleting the
+// destination on nearly every task: a collection agent is sent to find facts
+// that live below the fold of a long page (1,208 of 1,251 refs dropped on
+// nodejs.org's cli.html, leaving 37 sidebar links). So the viewport is now a
+// hint, never a filter: candidates come from the full page tree, and which of
+// them are off-screen is reported (the loop scrolls a target into view before
+// clicking it) but never removes one from the list. The 120 cap still binds, in
+// DOM order, which is what keeps the list scroll-invariant.
 //
 // Pure text in, JSON out. No browser, no network, which is what makes the trust
 // boundary checkable from a fixture:
@@ -77,30 +87,41 @@ export function parseSnapshot(snapshotText) {
   return lines
 }
 
-// Steps 2 through 7, in spec order.
+// Steps 1 through 7 of spec order (the commit filter is step 8).
 //
-// offscreenRefs is the one thing the text tree cannot answer: snapshotText()
-// defaults to full_page and marks nothing for being below the fold. The loop
-// supplies the refs it measured outside the viewport, the fixture supplies them
-// by hand. Empty is a valid answer, not a silent failure.
+// visibleRefs is the hint: the refs the loop measured inside the viewport. It
+// changes nothing about membership — a candidate below the fold is still
+// offered, because that is where a collection agent's destination lives — it
+// only counts how many offered candidates a click would have to scroll into
+// view first. The fixture supplies the set by hand; empty is a valid answer
+// (nothing revealed yet), and so is the full set (everything on screen).
 export function pruneCandidates(snapshotText, options) {
   return pruneDetail(snapshotText, options).candidates
 }
 
-// The same pipeline, plus how many nodes step 7 removed. The loop needs that
-// number: an empty list means "nothing to click", but an empty list that step 7
-// emptied means "only commit-like controls remain", which is its own exit.
-export function pruneDetail(snapshotText, { offscreenRefs = [] } = {}) {
+// The same pipeline, plus two numbers the loop branches on. commitCount: an
+// empty list means "nothing to click", but an empty list that step 7 emptied
+// means "only commit-like controls remain", which is its own exit.
+// offscreenCount: how many offered candidates sit below the fold right now.
+//
+// currentUrl drops self-referential anchors: a candidate whose url is exactly
+// the current page's url cannot change anything by being clicked — not the
+// page, not the scroll position — so offering it only invites the no-progress
+// guard to clean up afterwards. Dropped before the dedupe so a same-labelled
+// sibling with a different target surfaces in its place.
+export function pruneDetail(snapshotText, { visibleRefs = [], currentUrl = null } = {}) {
   const lines = parseSnapshot(snapshotText)
-  const offscreen = new Set(offscreenRefs.map(String))
+  const visible = new Set(visibleRefs.map(String))
   const kept = []
 
-  // 1. interactive nodes only, 2. drop unlabelled, 3. drop off-viewport.
+  // 1. interactive nodes only, 2. drop unlabelled, 3. drop self-referential
+  // anchors. No viewport filter: the full tree is the offer, DOM order is the
+  // order, and the cap below is the only truncation.
   for (let index = 0; index < lines.length; index += 1) {
     const node = lines[index]
     if (node.kind !== 'node' || !node.ref) continue
     if (!INTERACTIVE_ROLES.has(node.role)) continue
-    if (offscreen.has(node.ref)) continue
+    if (currentUrl && node.url && node.url === currentUrl) continue
 
     const texts = [node.name].filter(Boolean)
     const child = lines[index + 1]
@@ -130,17 +151,19 @@ export function pruneDetail(snapshotText, { offscreenRefs = [] } = {}) {
     else unique.set(candidate.label, { ...candidate, count: 1 })
   }
 
-  // 5. truncate, 6. cap, 7. remove commit-like controls. Only ref, label and
+  // 5. truncate, 6. cap, 7. the trust boundary follows in `allowed`. Only ref, label and
   // count go to Jev; loc and the raw texts were for matching, not for sending.
   const capped = [...unique.values()].slice(0, MAX_CANDIDATES)
   const allowed = capped.filter((candidate) => !isCommitLike(candidate))
+  const candidates = allowed.map((candidate) => ({
+    ref: candidate.ref,
+    label: truncate(candidate.label),
+    count: candidate.count,
+  }))
   return {
-    candidates: allowed.map((candidate) => ({
-      ref: candidate.ref,
-      label: truncate(candidate.label),
-      count: candidate.count,
-    })),
+    candidates,
     commitCount: capped.length - allowed.length,
+    offscreenCount: candidates.filter((candidate) => !visible.has(candidate.ref.slice(1))).length,
   }
 }
 
@@ -157,18 +180,24 @@ function isCommitLike(candidate) {
     || SUBMIT_INPUT.test(candidate.loc ?? '')
 }
 
-// A hash of the pruned candidate list plus the URL, for the ping-pong guard
-// (spec.md open question 3). Deliberately ref-free: refs are backend node ids
-// that a harmless re-render can renumber, and a fingerprint that moves would
-// mean the guard never fires.
+// A hash of the pruned candidate list plus the URL, for the ping-pong and
+// repeat-page guards (spec.md open question 3). Two invariants, both load-bearing:
+//
+// - Ref-free. Refs are CDP backend node ids that a harmless re-render can
+//   renumber, so only `label|count` pairs are hashed.
+// - Scroll-stable (#10). The loop scrolls on purpose now, so anything that
+//   moves with the scroll position would make the guards misfire on every
+//   scroll. The URL is hashed without its fragment (an in-page anchor jump is
+//   a position change, not a page change), and the pairs are hashed in sorted
+//   order so no caller can accidentally make the hash order-sensitive.
 export async function pageFingerprint(url, candidates) {
   const crypto = await import('node:crypto')
-  const body = candidates.map((candidate) => `${candidate.label}|${candidate.count}`).join('\n')
-  return crypto.createHash('sha256').update(`${url}\n${body}`).digest('hex').slice(0, 8)
+  const body = candidates.map((candidate) => `${candidate.label}|${candidate.count}`)
+  const canonical = [url.replace(/#.*$/, ''), ...body.sort()].join('\n')
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 8)
 }
 
 const CHECK_URL = 'https://shop.example.com/'
-const FIXTURE_OFFSCREEN = [30] // "Far away button", below the fold.
 
 async function selfCheck() {
   const assert = (await import('node:assert/strict')).default
@@ -180,21 +209,42 @@ async function selfCheck() {
     join(dirname(fileURLToPath(import.meta.url)), 'fixtures/snapshot.txt'),
     'utf8',
   )
-  const candidates = pruneCandidates(snapshot, { offscreenRefs: FIXTURE_OFFSCREEN })
+  // Every ref is on screen except 30, the "Far away button" below the fold.
+  const allRefs = [...snapshot.matchAll(/\bref=(\d+)/g)].map((match) => match[1])
+  const fixtureVisible = allRefs.filter((ref) => ref !== '30')
+  const detail = pruneDetail(snapshot, { visibleRefs: fixtureVisible })
+  const candidates = detail.candidates
   const labels = candidates.map((candidate) => candidate.label)
 
-  // The loop's empty-list distinction: 4 controls were removed by step 7.
-  assert.equal(pruneDetail(snapshot, { offscreenRefs: FIXTURE_OFFSCREEN }).commitCount, 4)
+  // The loop's empty-list distinction: 4 controls were removed by the filter.
+  assert.equal(detail.commitCount, 4)
 
-  // Trust boundary: the submit button (an input[type=submit] wearing its text),
-  // the "Send" link, the "Buy now" button, the unsubscribe link.
+  // Trust boundary, unchanged by the viewport fix: the submit button (an
+  // input[type=submit] wearing its text), the "Send" link, the "Buy now"
+  // button, the unsubscribe link. Widening what is offered never widens what
+  // is allowed.
   for (const gone of ['Submit', 'Buy now', 'Send', 'Unsubscribe from all emails']) {
     assert.ok(!labels.some((label) => label.includes(gone)), `${gone} reached Jev`)
   }
-  assert.ok(!candidates.some((candidate) => SUBMIT_INPUT.test(candidate.loc)))
 
-  // Off-viewport and label-less nodes.
-  assert.ok(!labels.includes('Far away button'), 'off-viewport node survived')
+  // The reachability fix itself: a below-the-fold node is offered, counted as
+  // off-screen, and no longer dropped. M1 measured the old rule deleting the
+  // destination on 8 of 9 failures.
+  assert.ok(labels.includes('Far away button'), 'off-screen node was dropped')
+  assert.equal(detail.offscreenCount, 1, 'exactly the one below-the-fold candidate is off-screen')
+
+  // Visibility is a hint, never a filter: the offer is byte-identical whatever
+  // the loop says is on screen, and the counts move with it.
+  assert.deepEqual(pruneCandidates(snapshot, {}), candidates, 'an empty visible set filtered')
+  assert.deepEqual(
+    pruneCandidates(snapshot, { visibleRefs: allRefs }),
+    candidates,
+    'a full visible set filtered',
+  )
+  assert.equal(pruneDetail(snapshot, {}).offscreenCount, candidates.length, 'nothing revealed')
+  assert.equal(pruneDetail(snapshot, { visibleRefs: allRefs }).offscreenCount, 0, 'everything revealed')
+
+  // Label-less nodes.
   assert.ok(!candidates.some((candidate) => candidate.ref === '@26'), 'label-less button survived')
   assert.ok(!candidates.some((candidate) => candidate.ref === '@31'), 'label-less textbox survived')
   assert.ok(candidates.every((candidate) => candidate.label.trim()), 'an empty label survived')
@@ -208,23 +258,50 @@ async function selfCheck() {
     { ref: '@27', label: 'Read more', count: 2 },
   )
 
-  // Truncation, and the cap.
+  // A self-referential anchor is a guaranteed no-op click, so it never reaches
+  // Jev; dropped before the dedupe, its same-labelled sibling with a different
+  // target surfaces in its place.
+  const elsewhere = pruneCandidates(snapshot, { currentUrl: 'https://shop.example.com/r/1' })
+  assert.deepEqual(
+    elsewhere.find((candidate) => candidate.label === 'Read more'),
+    { ref: '@28', label: 'Read more', count: 1 },
+    'the anchor we are sitting on is dropped, its sibling surfaces',
+  )
+  assert.equal(elsewhere.length, candidates.length, 'a same-label sibling keeps the seat')
+  assert.ok(!elsewhere.some((candidate) => candidate.ref === '@27'), 'the no-op ref is gone')
+
+  // Truncation, and the cap. 149 unique labels -> 120 kept in DOM order -> 4
+  // commit controls removed. "Far away button" now takes one of the 120 ahead
+  // of the Results, so the cutoff lands one entry earlier than before the fix.
   const long = candidates.find((candidate) => candidate.label.endsWith('…'))
   assert.ok(long && long.label.length === MAX_LABEL_CHARS, 'long label not truncated to 120')
-  assert.equal(candidates.length, 116, 'cap: 148 entries -> 120 -> 4 commit controls removed')
-  assert.ok(labels.includes('Result 112') && !labels.includes('Result 113'), 'cap kept the wrong entries')
+  assert.equal(candidates.length, 116, 'cap: 149 entries -> 120 -> 4 commit controls removed')
+  assert.ok(labels.includes('Result 111') && !labels.includes('Result 112'), 'cap kept the wrong entries')
   assert.ok(candidates.length <= MAX_CANDIDATES)
 
   // Fingerprint stability: the same page re-rendered with every ref renumbered
-  // is the same page.
+  // is the same page, and so is the same page scrolled (a fragment-only URL
+  // change) or handed to the hash in a different order.
   const renumbered = snapshot.replace(/ref=(\d+)/g, (_, ref) => `ref=${Number(ref) + 1000}`)
   assert.equal(
     await pageFingerprint(CHECK_URL, candidates),
-    await pageFingerprint(CHECK_URL, pruneCandidates(renumbered, { offscreenRefs: [1030] })),
+    await pageFingerprint(CHECK_URL, pruneCandidates(renumbered, { visibleRefs: fixtureVisible.map((ref) => String(Number(ref) + 1000)) })),
+    'a re-render renumbers refs',
+  )
+  assert.equal(
+    await pageFingerprint(`${CHECK_URL}#section`, candidates),
+    await pageFingerprint(CHECK_URL, candidates),
+    'an in-page anchor jump is not a page change',
+  )
+  assert.equal(
+    await pageFingerprint(CHECK_URL, [...candidates].reverse()),
+    await pageFingerprint(CHECK_URL, candidates),
+    'hash order is canonical',
   )
   assert.notEqual(
     await pageFingerprint(CHECK_URL, candidates),
     await pageFingerprint('https://shop.example.com/other', candidates),
+    'a different page hashes differently',
   )
 
   return candidates.length

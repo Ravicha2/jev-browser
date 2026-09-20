@@ -69,6 +69,8 @@ Exit reasons across all 30 task-runs: `repeat_page` 10, `cannot_choose` 9,
 
 **No-go. Escalation rate 0.429 in the run of record (0.500 and 0.525 in the two
 earlier runs, 0.485 pooled), and 1 of 10 tasks reached `done`.**
+**Superseded by "The re-measurement (#10)" at the bottom of this file: after the
+reachability fix the same gate reads continue.**
 
 One thing to say plainly before the verdict, because the gate as written does not
 decide this on its own: the rule is under about 20% continue, over 50% prune
@@ -313,3 +315,91 @@ are second-order next to the prune.
 
 Re-run `scripts/measure.js m1-goals.json` against these same 10 goals afterwards, and
 pin `jev-1.13.0` at that point. Only that re-run says anything about the pick.
+
+## The re-measurement (#10): reachability fixed
+
+The resolution slice for the no-go above. Three changes from #10 (the viewport
+became a hint, a read-scroll was added, `invalid_response` got its retry) plus
+four defects the re-run itself exposed and that died in the same slice:
+
+| Fix | What the re-run measured |
+|---|---|
+| Viewport is a hint (#10 change 1) | `cannot_choose` over "destination not offered": 9 exits across 30 pre-fix task-runs -> 1 after. The index now yields 74 candidates (was 21), `cli.html` 120 (the cap binds; was 37). |
+| Read-scroll (#10 change 2) | Fires on a stuck answer (`retry`, or a confident pick that just proved dead) on a page worth reading, max 3 viewports per page. Ran in tasks 1 and 3 of the record run. |
+| `invalid_response` retry (#10 change 3) | 2 pre-fix exits, 0 after. No recurrence to measure the retry itself against. |
+| Snapshot order | `snapshotText()` invalidates the previous ref map: candidates from the full tree were unclickable (`Unknown ref`) because the viewport-scoped call was taken last. The viewport call now comes first. |
+| Container reveal | nodejs.org's left nav (`#column2`) is an independent scroll container (2691px of content in a 683px client); page-level `scrollTo` reveals nothing in it and `click()` on a clipped element silently no-ops. All 7 `no_progress` exits of the first re-run traced here. The reveal now scrolls every independent scroll container toward the target's offset. |
+| Self-referential anchors dropped | A candidate whose url equals the current page's url is a guaranteed no-op click; dropped before the dedupe so a same-labelled sibling with a different target surfaces. |
+| Revisit-continue | Returning to a page after a wrong cross-reference is recovery: one re-decision per fingerprint with the outbound and inbound labels spent, then a real `repeat_page` escalate. |
+| Retry re-asks over the same list | The old tighter slice truncated in DOM order and deleted the destination on full-tree lists (task 3's answer sat beyond entry 20). `RETRY_CANDIDATES` is removed. |
+
+`MODEL` is pinned to `jev-1.13.0`, the version that answered every step of every
+run here. Same goals, same harness, same gate arithmetic as the no-go above.
+
+### Per-task, run of record (`~/.claude/jev-browser/runs/m1-2026-09-20T23-00-50/`)
+
+| # | goal (short) | exit | reason | steps | clicks | retries | rate | wall | in tok | out tok |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `--inspect` host:port | escalate | `repeat_page` | 8 | 5 | 0 | 0.13 | 19.8s | 58,898 | 9,598 |
+| 2 | `node:sqlite` version+stability | **done** | | 3 | 2 | 0 | 0.00 | 9.5s | 23,418 | 3,805 |
+| 3 | strip-types flag rename | escalate | `cannot_choose` | 6 | 2 | 1 | 0.33 | 17.2s | 48,251 | 8,191 |
+| 4 | Permission Model modes | **done** | | 3 | 1 | 0 | 0.00 | 5.0s | 21,114 | 3,475 |
+| 5 | cluster worker count | escalate | `low_confidence` | 5 | 3 | 1 | 0.40 | 11.6s | 37,412 | 6,391 |
+| 6 | `node:sqlite` sync class | **done** | | 2 | 1 | 0 | 0.00 | 4.6s | 14,556 | 2,343 |
+| 7 | `maxBuffer` limits/default | **done** | | 4 | 3 | 0 | 0.00 | 11.8s | 32,592 | 5,234 |
+| 8 | test runner watch mode | **done** | | 3 | 2 | 0 | 0.00 | 10.0s | 22,662 | 3,805 |
+| 9 | FS permissions default | **done** | | 3 | 2 | 0 | 0.00 | 8.0s | 20,865 | 3,453 |
+| 10 | `--inspect-wait` version | escalate | `low_confidence` | 4 | 1 | 2 | 0.75 | 6.4s | 28,457 | 4,686 |
+
+Totals: **41 steps, 6 done, escalation rate 0.195, 308,225 input tokens
+(51,273 out), 104s of wall clock.**
+
+| Run | Done | Steps | Escalation rate | Input tokens |
+|---|---|---|---|---|
+| of record (`23-00-50`) | **6/10** | 41 | **0.195** | 308,225 |
+| repeat (`23-02-51`) | 6/10 | 46 | 0.152 | 342,750 |
+| repeat (`23-05-32`) | 6/10 | 51 | 0.157 | 389,413 |
+| pooled | **18/30** | 138 | **0.167** | 1,040,388 |
+
+Exit reasons across all 30 task-runs: `done` 18, `low_confidence` 6,
+`repeat_page` 5, `cannot_choose` 1. `no_progress` and `invalid_response`, the
+two dominant pre-fix families, are gone.
+
+### The gate, again
+
+**Continue. Escalation rate 0.167 pooled (0.152-0.195 per run), under the ~20%
+line, and 18 of 30 task-runs reach `done` (from 1 of 30).** The measurement is
+now about the pick: the destination is in the list, and the pick carries 6 of
+10 tasks per run. The honest cost: input tokens roughly doubled per run
+(~347k pooled mean vs ~154k pre-fix) because full-tree candidate lists are 3-6x
+bigger. At $0.042/Mtok that is ~$0.015 per task — still not a constraint.
+
+### What still fails, one residual each
+
+- **Task 1 (`repeat_page`): cross-page ping-pong.** inspector.html and cli.html
+  each hold half the `--inspect` story; the loop crossed between them until the
+  revisit budget spent. Not a guard defect: both pages were decided, neither
+  half was read far enough.
+- **Task 3 (`cannot_choose`): the cap deletes the destination on monsters.**
+  `cli.html` yields exactly 120 candidates; the `--experimental-strip-types`
+  TOC entry sits beyond the cutoff. The list has to get *better*, not longer —
+  this is the measured instance of #10's own warning.
+- **Task 5 (`low_confidence`): the revisit spends the label it needs.** The
+  first 'Usage and example' click landed on a same-labelled cross-ref to
+  `synopsis.html`, and the revisit then spent that label — the real section
+  anchor included. Label-keyed spending cannot tell the twins apart.
+- **Task 10 (`low_confidence`): ranking accuracy at the new list size.** The
+  `--inspect-wait` TOC entry is on offer; the pick stayed shaky twice. This one
+  is genuinely about the model, and 6 occurrences across 30 task-runs make
+  `low_confidence` the residual to watch.
+
+### Tunables changed or added by this slice
+
+| Tunable | Value | Trades off | Evidence from the re-run |
+|---|---|---|---|
+| `MODEL` | `jev-1.13.0` (pinned) | Reproducibility vs alias movement | Answered every step of all six runs here; pinned per #10's acceptance. |
+| `RETRY_CANDIDATES` | **removed** | — | The tighter slice deleted the destination on full-tree lists (task 3, first re-run). The retry re-asks over the same list. |
+| `WORTH_READING` | 0.5 | Lower scrolls navigation; higher skips readables | Distinguished the two pages it needed to: scrolled `cli.html`/`inspector.html`, left the index alone. |
+| `PAGE_SCROLL_LIMIT` | 3 | Higher reads deeper into monsters; costs steps | Fired in tasks 1 and 3; 3 viewports cannot cover an 84k px page — the TOC anchors are the real mechanism there, and the cap keeps the loop from grinding. |
+| `PROGRESS_SY_EPSILON` | 8 px | Smaller misfires on jitter; larger ignores real scrolls | No false progress across 138 steps (zero `no_progress` exits). |
+| `REVISIT_LIMIT` | 1 | Higher tolerates more wandering | 4 fires in the record run; task 4's `done` went through a revisit. The second `repeat_page` (task 1) is a true stop. |

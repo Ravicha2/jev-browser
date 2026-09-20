@@ -1,4 +1,5 @@
-// jev-browser explore loop (issue #3, spec.md "The step loop").
+// jev-browser explore loop (issue #3, reachability fixed in #10; spec.md "The
+// step loop").
 //
 // Exploratory collection. Snapshot, prune, ask Jev which candidate leads toward
 // the goal, branch in code, click what it named, repeat to the step budget. Jev
@@ -18,15 +19,22 @@
 // from the self-check at the bottom without opening a browser.
 
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
-const MODEL = 'jev-latest'
+// Pinned (#10): M1 ran every step on jev-1.13.0 through the alias, and an
+// alias that moves would make the gate unreadable. Log the response `model`
+// field regardless, so a silent bump is visible in the trail.
+const MODEL = 'jev-1.13.0'
 
 // spec.md "Confidence". Thresholds start here and get tuned on our own pages.
 const GOAL_MET = 0.8 // >= exits done
-const NEXT_TARGET_CONFIDENCE = 0.5 // < retries once with a tighter list, then escalates
+const NEXT_TARGET_CONFIDENCE = 0.5 // < re-asks once over the same list, then escalates
 const CREDENTIAL_NOUL = 0.7 // > hands off to the user
 const CANNOT_CHOOSE_NOUL = 0.6 // > retries once, then escalates
 const ONLY_COMMIT_NOUL = 0.5 // > escalates
 const LAYOUT_NOUL = 0.6 // spec names no number for this one; mirrors cannot_choose.
+const WORTH_READING = 0.5 // > and a page the goal asks us to read gets scrolled before escalating
+const PAGE_SCROLL_LIMIT = 3 // viewports the loop will read down one page; monsters are served by their TOC anchors
+const PROGRESS_SY_EPSILON = 8 // px of scroll drift that still counts as "no change"
+const REVISIT_LIMIT = 1 // re-decisions granted per fingerprint before repeat_page escalates for real
 
 // A Choice answer is only used after it validates: the chosen id must be one of
 // the ids we offered, the probability keys must be exactly that set, every number
@@ -39,8 +47,6 @@ const NO_ANSWER = 'none'
 // counts no *progress*, which is the thing worth counting, not no navigation.
 const NO_PROGRESS_LIMIT = 3
 const STALE_LIMIT = 2 // a decision invalidated twice by a moved page
-const RETRY_CANDIDATES = 20 // the "tighter candidate list" of the retry
-
 // state is capped at 32k including the longest question, so shave before sending.
 const MAX_PAGE_CHARS = 12000
 const SHORT_PAGE_CHARS = 3000
@@ -66,6 +72,18 @@ const JOB_PATH = `${HOME}/.claude/jev-browser/job.json`
 
 // ---------------------------------------------------------------- pure control
 
+// The labels spent by a return: the click that left the page we are back on,
+// and the click that brought us back. A collection agent returning from a
+// wrong cross-reference is recovery, not wandering — the repeat-page guard
+// grants one re-decision per fingerprint, and those two paths are exhausted.
+export function labelsToSpend(history) {
+  return history
+    .filter((entry) => typeof entry.decision === 'string' && entry.decision.startsWith('click'))
+    .slice(-2)
+    .map((entry) => entry.label)
+    .filter(Boolean)
+}
+
 // The guards that need no decision. Returns an exit object to stop, or null to
 // keep going. The least-bad candidate is never picked: an empty list ends the
 // round, and so does a list step 7 emptied.
@@ -86,28 +104,31 @@ export function preflight({
   return null
 }
 
-// Consecutive actions with no page change. `lastFingerprint` is the page an
-// action was taken from, still awaiting its post-action observation; null when
-// the last step acted on nothing, so a retry neither counts nor resets.
-export function progressAfter({ lastFingerprint, noProgress }, fingerprint) {
-  if (lastFingerprint === null) return { lastFingerprint: null, noProgress }
-  return {
-    lastFingerprint: null,
-    noProgress: fingerprint === lastFingerprint ? noProgress + 1 : 0,
-  }
+// Consecutive actions with no observable change. The fingerprint is
+// scroll-stable on purpose, so an action that only moved the viewport — a
+// purposeful read-scroll, an in-page anchor jump — counts on `sy`, above a
+// small drift epsilon so a sticky header or sub-pixel jitter cannot fake
+// progress forever. `lastFingerprint` is null when the last step acted on
+// nothing, so a retry neither counts nor resets.
+export function progressAfter({ lastFingerprint, lastSy, noProgress }, { fingerprint, sy }) {
+  if (lastFingerprint === null) return { lastFingerprint: null, lastSy: null, noProgress }
+  const changed = fingerprint !== lastFingerprint
+    || Math.abs((sy ?? 0) - (lastSy ?? 0)) > PROGRESS_SY_EPSILON
+  return { lastFingerprint: null, lastSy: null, noProgress: changed ? 0 : noProgress + 1 }
 }
 
-// The ref to click is read from the snapshot taken immediately before the click,
-// at the position Jev chose from, and never carried over from the decision step.
-// A page that moved between the two is not acted on at all: re-observe and
-// re-ask. This is a safety property, not just an accuracy one, because a stale
-// ref is a misclick.
+// The target to click is found in the snapshot taken immediately before the
+// click, and never carried over from the decision step. The label is the stable
+// key, not the index or the ref: the list order can shift with the page's
+// scroll and refs belong to the snapshot that read them, but a deduped
+// candidate list carries each label exactly once. A page that moved to a
+// different fingerprint between the two observations is not acted on at all:
+// re-observe and re-ask. A stale ref is a misclick, so this is a safety
+// property, not just an accuracy one.
 export function resolveTarget(decision, observed, fresh) {
   if (!observed || !fresh) return null
   if (fresh.fingerprint !== observed.fingerprint) return null
-  const candidate = fresh.candidates[decision.index]
-  if (!candidate || candidate.label !== decision.label) return null
-  return candidate.ref
+  return fresh.candidates.find((candidate) => candidate.label === decision.label)?.ref ?? null
 }
 
 // What Jev gets of the history: where we went and what was clicked, in words. Not
@@ -200,9 +221,13 @@ export function readDecision({ response, candidates, retried }) {
   try {
     ;({ choice, confidence } = validateChoice(response, 'next_target', offered))
   } catch (error) {
-    // Nothing executes on a malformed answer. Same for a Noul that never parsed,
-    // which propagates to the one catch-all at the bottom.
-    return { kind: 'escalate', reason: 'invalid_response', detail: error.message }
+    // Nothing executes on a malformed answer. It gets the one retry the other
+    // shaky answers get (#10 change 3: two of M1's nine failures were a Choice
+    // disagreeing with itself, and a re-ask is cheaper than an escalation),
+    // then escalates with the detail. Same for a Noul that never parsed, which
+    // propagates to the one catch-all at the bottom.
+    if (retried) return { kind: 'escalate', reason: 'invalid_response', detail: error.message }
+    return { kind: 'retry', trigger: 'invalid_response', detail: error.message }
   }
 
   if (choice === NO_ANSWER) return retryOr('cannot_choose')
@@ -210,6 +235,24 @@ export function readDecision({ response, candidates, retried }) {
 
   const index = candidates.findIndex((candidate) => candidate.ref === choice)
   return { kind: 'click', index, label: candidates[index].label }
+}
+
+// The scroll action (#10 change 2), decided in code and not by Jev, for the
+// two shapes a read-scroll answers: the answer for this page is a retry —
+// nothing offered advances, or the pick stayed shaky — or it is a confident
+// pick that just proved dead (the same label, clicked, changed nothing: Jev is
+// stateless between steps and will name it again). Either way, when Jev also
+// says this page is one the goal asks us to read, the unread remainder below
+// the fold is a better bet than a third identical click or an escalation.
+// Serves `state.current_page` only; reachability is the candidate rule's job.
+// Bounded per page, because a 123-viewport page cannot be read a screen at a
+// time inside a step budget — long pages are served by their own TOC anchors,
+// which the candidate rule now offers.
+export function shouldScrollPage({ stuck, worthReading, moreBelow, scrolls }) {
+  return stuck === true
+    && worthReading > WORTH_READING
+    && moreBelow
+    && scrolls < PAGE_SCROLL_LIMIT
 }
 
 // The questions. One request per step, several speculative questions in it:
@@ -294,37 +337,78 @@ async function ask(body, key) {
 
 const refsIn = (snapshot) => new Set([...snapshot.matchAll(/\bref=(\d+)/g)].map((match) => match[1]))
 
-// One observation: the page tree, the pruned candidates, and the fingerprint the
-// guards compare.
+// Unread content below the fold, asked of the page itself. js() returns its
+// expression's value (verified on the live runtime).
+async function moreBelow(observed) {
+  const viewHeight = await js('window.innerHeight')
+  const scrollHeight = await js('document.documentElement.scrollHeight')
+  return scrollHeight > observed.sy + viewHeight + PROGRESS_SY_EPSILON
+}
+
+// One observation: the page tree, the pruned candidates, and the fingerprint
+// the guards compare.
 //
-// Off-viewport nodes are the one thing the text tree does not mark, so take the
-// viewport-scoped tree beside the full one and subtract: a ref in the page but
-// not in the viewport is below the fold. Refs are CDP backend node ids, so the
-// same element carries the same number in both calls.
-//
-// ponytail: two snapshots per observation, and the offscreen set moves when the
-// page auto-scrolls, which moves the fingerprint with it. Upgrade path is
-// geometry from element rects if the guards ever misfire on a scrolling page.
+// The viewport is a hint now, never a filter (#10 change 1): candidates come
+// from the full tree, and the viewport-scoped tree only says which refs are on
+// screen — the off-screen count, and which clicks need a reveal scroll first.
+// Refs are CDP backend node ids, so the same element carries the same number in
+// both calls, **but only the most recent snapshotText()'s map is addressable**:
+// a below-the-fold ref is absent from the viewport map, which is why the
+// viewport tree is taken FIRST and the full tree LAST — the live ref map is
+// then the superset every candidate ref comes from. (Measured: clicking a
+// full-tree-only ref in the other order fails with `Unknown ref`.)
+// `pageText` stays viewport-scoped: it is the text channel the read-scroll
+// serves, and the full tree of a long page would bury the answer under
+// navigation chrome. `sy` is what the no-progress guard counts scrolls and
+// in-page anchor jumps on, since the fingerprint cannot move with scroll
+// position by design.
 async function observe() {
-  const page = await snapshotText()
   const visible = await snapshotText({ scope: 'only_within_viewport' })
+  const page = await snapshotText()
   const info = await pageInfo()
   if (info.dialog) throw new Error('a native browser dialog is open; the page is blocked')
 
-  const onScreen = refsIn(visible)
-  const offscreenRefs = [...refsIn(page)].filter((ref) => !onScreen.has(ref))
-  const { candidates, commitCount } = pruneDetail(page, { offscreenRefs })
+  const { candidates, commitCount, offscreenCount } = pruneDetail(page, {
+    visibleRefs: [...refsIn(visible)],
+    currentUrl: info.url,
+  })
 
   return {
     url: info.url,
-    // What Jev reads is the visible tree, not the head of the full one: on a
-    // large page the first 12k characters are navigation chrome, and the answer
-    // is nowhere in them.
+    sy: info.sy,
+    offscreenCount,
     pageText: visible,
     candidates,
     commitOnly: candidates.length === 0 && commitCount > 0,
     fingerprint: await pageFingerprint(info.url, candidates),
   }
+}
+
+// An offered candidate can sit below the fold, so a pick may name something
+// off-screen. Scrolling it into view first is what makes every offered
+// candidate genuinely clickable, and it keeps the post-click observation
+// meaningful. Measured on nodejs.org (#10): elementCenter reports the
+// element's content offset, and deep links can live inside an independently
+// scrolling container (#column2, 2691px of content in a 683px client) where
+// page-level scrollTo changes nothing and a click on the clipped element
+// silently no-ops. So the reveal scrolls the page AND every independent
+// scroll container toward the target's offset: whichever owns the element
+// reveals it, the others scroll harmlessly. This must not snapshot: the refs
+// belong to the observation the decision was resolved from.
+async function reveal(target) {
+  const center = await elementCenter(target)
+  const viewHeight = await js('window.innerHeight')
+  if (center.y >= 0 && center.y <= viewHeight) return false
+  const offset = Math.round(center.y)
+  await js(`(() => {
+    window.scrollTo(0, Math.max(0, ${offset} - window.innerHeight / 2))
+    for (const el of document.querySelectorAll('*')) {
+      if (el !== document.documentElement && el.scrollHeight > el.clientHeight + 20 && el.clientHeight > 100) {
+        el.scrollTop = Math.max(0, ${offset} - el.clientHeight / 2)
+      }
+    }
+  })()`)
+  return true
 }
 
 // The round's token totals and the model that answered. The trail is only the
@@ -382,21 +466,35 @@ async function main() {
 
   let steps = 0
   let retried = false
-  let tight = false
   let stale = 0
-  let progress = { lastFingerprint: null, noProgress: 0 }
+  let progress = { lastFingerprint: null, lastSy: null, noProgress: 0 }
+  // The most recent click's label, cleared whenever the page changes; the
+  // input to the dead-repeat half of the scroll decision.
+  let lastAction = null
+  // Read-scrolls spent per fingerprint. Keyed on the fingerprint, which is
+  // scroll-stable, so scrolling a page never resets its own count.
+  const pageScrolls = new Map()
+  // Re-decisions spent per fingerprint by the repeat-page guard.
+  const revisits = new Map()
+  // Labels exhausted by the latest revisit-continue; offered to no ask until
+  // the next action retires them.
+  const spentFor = new Set()
 
   while (true) {
     steps += 1
     const observed = await observe()
 
     // Moving on from a page we acted on makes that page visited, and coming back
-    // to it later is the repeat-page guard. Staying on it is not a repeat: that
-    // is the no-progress guard's business, and it counts it.
+    // to it later is the repeat-page guard. Staying on it is not a repeat — not
+    // even scrolled: the fingerprint is scroll-stable, and a read-scroll or an
+    // in-page anchor is the no-progress guard's business, counted on `sy`.
     if (progress.lastFingerprint && progress.lastFingerprint !== observed.fingerprint) {
       visited.add(progress.lastFingerprint)
     }
-    progress = progressAfter(progress, observed.fingerprint)
+    progress = progressAfter(progress, { fingerprint: observed.fingerprint, sy: observed.sy })
+    // A step that observed change retires the last action: only an unbroken
+    // run of dead actions makes a pick a dead repeat.
+    if (progress.noProgress === 0) lastAction = null
 
     const stop = preflight({
       step: steps,
@@ -408,7 +506,27 @@ async function main() {
       visited,
       escalated,
     })
-    if (stop) {
+    let revisitPending = false
+    if (stop?.reason === 'repeat_page') {
+      // Coming back to a page after a wrong cross-reference is recovery, not
+      // wandering: grant one re-decision with the outbound and inbound paths
+      // spent, and escalate only if this page still cannot be left usefully.
+      const seen = revisits.get(observed.fingerprint) ?? 0
+      if (seen < REVISIT_LIMIT) {
+        revisits.set(observed.fingerprint, seen + 1)
+        visited.delete(observed.fingerprint)
+        for (const label of labelsToSpend(history)) spentFor.add(label)
+        revisitPending = true
+      } else {
+        return exitObject({
+          status: 'escalate',
+          reason: 'repeat_page',
+          step: steps,
+          state: observed,
+          extra: { goal: job.goal, partial_findings: [], trail: history.slice(-TRAIL_STEPS) },
+        })
+      }
+    } else if (stop) {
       return exitObject({
         status: 'escalate',
         reason: stop.reason,
@@ -419,8 +537,13 @@ async function main() {
     }
 
     // Every step asks again over a fresh snapshot, so an @N ref is only ever used
-    // in the step that read it. `tight` is the retry's smaller list.
-    const candidates = tight ? observed.candidates.slice(0, RETRY_CANDIDATES) : observed.candidates
+    // in the step that read it. The retry re-asks over the SAME list: the old
+    // tighter slice truncated in DOM order, which on a full-tree list deletes
+    // the destination (measured: task 3's answer sat beyond entry 20, and the
+    // tightened re-ask exited cannot_choose over a list that no longer held it).
+    const candidates = spentFor.size > 0
+      ? observed.candidates.filter((candidate) => !spentFor.has(candidate.label))
+      : observed.candidates
     const questions = buildQuestions(candidates)
     const state = fitState({
       goal: job.goal,
@@ -447,6 +570,7 @@ async function main() {
       history.push({ ...record, decision: what, ...extra })
       return history.slice(-TRAIL_STEPS)
     }
+    if (revisitPending) recorded('revisit')
 
     if (decision.kind === 'done') {
       // The ledger is slice #9, so an empty findings list is the correct outcome
@@ -485,10 +609,32 @@ async function main() {
       return exitObject({ status: 'escalate', reason: decision.reason, step: steps, state: observed, extra })
     }
 
+    // The read-scroll, ahead of both the retry and the click. `lastAction`
+    // holds the label of the most recent click and is cleared whenever the
+    // page last changed, so `deadRepeat` is true only when the identical pick
+    // has already failed to move anything. Jev is stateless between steps and
+    // will happily name the same dead target again; code breaks the tie.
+    const scrolls = pageScrolls.get(observed.fingerprint) ?? 0
+    const deadRepeat = progress.noProgress >= 1 && lastAction?.label === decision.label
+    const stuck = decision.kind === 'retry' || (decision.kind === 'click' && deadRepeat)
+    if (shouldScrollPage({
+      stuck,
+      worthReading: readNoul(response, 'worth_reading'),
+      moreBelow: await moreBelow(observed),
+      scrolls,
+    })) {
+      const to = Math.round(observed.sy + await js('window.innerHeight'))
+      await js(`window.scrollTo(0, ${to})`)
+      pageScrolls.set(observed.fingerprint, scrolls + 1)
+      recorded(`scroll to ${to}`)
+      progress.lastFingerprint = observed.fingerprint
+      progress.lastSy = observed.sy
+      continue
+    }
+
     if (decision.kind === 'retry') {
       // Once, then escalate: a second failure is an answer, not a reason to spin.
       retried = true
-      tight = true
       recorded(`retry:${decision.trigger}`)
       continue
     }
@@ -516,6 +662,18 @@ async function main() {
     // Consume the decision before any mutation: the ref is used exactly once, so
     // a click that throws cannot be retried into a double-click.
     decision.consumed = true
+
+    // An offered candidate can live below the fold; scroll it into view before
+    // clicking. A failed reveal falls through to the click itself: click() by
+    // ref does not require the element to be on screen (verified), only the
+    // post-click text channel is better when it is.
+    let revealed = false
+    try {
+      revealed = await reveal(target)
+    } catch {
+      revealed = false
+    }
+
     let clickError = null
     try {
       await click(target, { label: `step ${steps}: ${decision.label}`.slice(0, 64) })
@@ -526,14 +684,19 @@ async function main() {
 
     // Record the action before the next observation, so a stale post-action
     // snapshot cannot erase the record of something that did happen.
-    recorded(`click ${target}`, { label: decision.label, ...(clickError ? { error: clickError } : {}) })
+    recorded(
+      `click ${target}`,
+      { label: decision.label, ...(revealed ? { revealed: true } : {}), ...(clickError ? { error: clickError } : {}) },
+    )
 
     // The page this action was taken from, awaiting its post-action observation.
     // Acting also refreshes the retry budget: "retry once, then escalate" is a
     // rule about one decision, not about the whole run.
     progress.lastFingerprint = fresh.fingerprint
+    progress.lastSy = fresh.sy
+    lastAction = { label: decision.label }
     retried = false
-    tight = false
+    spentFor.clear()
   }
 }
 
@@ -558,27 +721,58 @@ async function runSelfCheck() {
   assert.equal(reason({ candidates: [], commitOnly: false }), 'cannot_choose', 'empty list')
   assert.equal(reason({}), null, 'a healthy step proceeds')
 
-  // No progress: counts consecutive unchanged pages, resets on a change, and
-  // ignores a step that acted on nothing.
-  let progress = { lastFingerprint: fp, noProgress: 0 }
-  progress = progressAfter(progress, fp)
-  progress = progressAfter({ ...progress, lastFingerprint: fp }, fp)
-  assert.equal(progress.noProgress, 2, 'two actions, same page')
-  assert.equal(progressAfter({ lastFingerprint: null, noProgress: 2 }, fp).noProgress, 2, 'no action, no count')
-  assert.equal(progressAfter({ lastFingerprint: fp, noProgress: 2 }, 'other').noProgress, 0, 'page changed')
+  // No progress: counts consecutive actions with no observable change — the
+  // fingerprint OR the scroll position — resets on either changing, ignores a
+  // step that acted on nothing, and does not let sub-pixel drift fake progress.
+  let progress = { lastFingerprint: fp, lastSy: 0, noProgress: 0 }
+  progress = progressAfter(progress, { fingerprint: fp, sy: 0 })
+  progress = progressAfter({ ...progress, lastFingerprint: fp, lastSy: 0 }, { fingerprint: fp, sy: 0 })
+  assert.equal(progress.noProgress, 2, 'two actions, same page, same scroll')
+  assert.equal(
+    progressAfter({ lastFingerprint: null, lastSy: null, noProgress: 2 }, { fingerprint: fp, sy: 0 }).noProgress,
+    2,
+    'no action, no count',
+  )
+  assert.equal(
+    progressAfter({ lastFingerprint: fp, lastSy: 0, noProgress: 2 }, { fingerprint: 'other', sy: 0 }).noProgress,
+    0,
+    'page changed',
+  )
+  assert.equal(
+    progressAfter({ lastFingerprint: fp, lastSy: 100, noProgress: 2 }, { fingerprint: fp, sy: 900 }).noProgress,
+    0,
+    'a scroll or an in-page anchor is progress',
+  )
+  assert.equal(
+    progressAfter({ lastFingerprint: fp, lastSy: 100, noProgress: 2 }, { fingerprint: fp, sy: 104 }).noProgress,
+    3,
+    'drift under the epsilon is not',
+  )
 
-  // The click target comes from the act-time snapshot, never from decision time.
+  // The click target comes from the act-time snapshot, never from decision
+  // time, and is found by label: order and refs can move, a deduped label
+  // cannot quietly duplicate.
   const observed = { fingerprint: fp, candidates: [{ ref: '@1', label: 'Read more' }] }
   const decision = { index: 0, label: 'Read more' }
-  const renumbered = { fingerprint: fp, candidates: [{ ref: '@900', label: 'Read more' }] }
-  assert.equal(resolveTarget(decision, observed, renumbered), '@900', 'ref read fresh, not reused')
+  const renumbered = { fingerprint: fp, candidates: [{ ref: '@900', label: 'Other' }, { ref: '@901', label: 'Read more' }] }
+  assert.equal(resolveTarget(decision, observed, renumbered), '@901', 'ref read fresh at the label, not the index')
   assert.equal(resolveTarget(decision, observed, { ...observed, fingerprint: 'moved' }), null, 'page moved')
   assert.equal(
     resolveTarget(decision, observed, { fingerprint: fp, candidates: [{ ref: '@1', label: 'Something else' }] }),
     null,
-    'label moved position',
+    'the label left the list',
   )
-  assert.equal(resolveTarget({ index: 4, label: 'x' }, observed, observed), null, 'index out of range')
+  assert.equal(resolveTarget({ index: 4, label: 'x' }, observed, observed), null, 'a label that was never offered')
+
+  // The read-scroll: a stuck answer (a retry, or a confident pick that just
+  // proved dead) on a page worth reading that still has content below the
+  // fold, and never more than the per-page limit.
+  const scrollCase = { stuck: true, worthReading: 0.9, moreBelow: true, scrolls: 0 }
+  assert.ok(shouldScrollPage(scrollCase), 'a stuck read scrolls')
+  assert.ok(!shouldScrollPage({ ...scrollCase, stuck: false }), 'a live pick is not intercepted')
+  assert.ok(!shouldScrollPage({ ...scrollCase, worthReading: 0.4 }), 'navigation is not scrolled')
+  assert.ok(!shouldScrollPage({ ...scrollCase, moreBelow: false }), 'nothing below the fold')
+  assert.ok(!shouldScrollPage({ ...scrollCase, scrolls: PAGE_SCROLL_LIMIT }), 'the per-page limit holds')
 
   // The trail Jev sees carries no refs: a ref belongs to the step that read it.
   assert.deepEqual(
@@ -590,6 +784,19 @@ async function runSelfCheck() {
     [{ step: 2, url: 'u', action: 'retry:low_confidence' }],
   )
   assert.equal(trailForJev(Array.from({ length: 40 }, (_, index) => ({ step: index }))).length, TRAIL_STEPS)
+
+  // A revisit spends the path out and the path back — clicks only, so scrolls
+  // and retries around the departure do not burn unrelated labels.
+  assert.deepEqual(
+    labelsToSpend([
+      { step: 1, decision: 'click @1', label: 'Cluster' },
+      { step: 2, decision: 'scroll to 900' },
+      { step: 3, decision: 'click @2', label: 'Usage and example' },
+      { step: 4, decision: 'click @3', label: 'Cluster' },
+    ]),
+    ['Usage and example', 'Cluster'],
+  )
+  assert.deepEqual(labelsToSpend([{ step: 1, decision: 'retry:low_confidence' }]), [], 'no clicks, nothing spent')
 
   // The request shaves the page before the questions.
   const questions = buildQuestions([{ ref: '@1', label: 'x'.repeat(200) }])
@@ -649,10 +856,17 @@ async function runSelfCheck() {
     'safety first',
   )
 
-  // Choice validation: every rejection is a reason not to act.
-  const rejects = (answer, message) => assert.equal(
-    decided(response({ ...sure, ...answer })).reason, 'invalid_response', message,
-  )
+  // Choice validation: every rejection is a reason not to act, and since #10
+  // each one first gets the single retry the other shaky answers get.
+  const rejects = (answer, message) => {
+    const first = decided(response({ ...sure, ...answer }))
+    assert.equal(first.kind, 'retry', message)
+    assert.equal(first.trigger, 'invalid_response', message)
+    assert.equal(
+      decided(response({ ...sure, ...answer }), { retried: true }).reason, 'invalid_response',
+      `${message}, then escalate`,
+    )
+  }
   rejects({ choice: '@9' }, 'an id we never offered')
   rejects({ choice: 'nope' }, 'a choice absent from the ids')
   rejects({ probabilities: { '@1': 1 } }, 'a missing id in the keys')
@@ -664,7 +878,7 @@ async function runSelfCheck() {
   rejects({ probabilities: undefined }, 'no probabilities at all')
   rejects({ confidence: 2 }, 'a confidence outside 0..1')
   rejects({ choice: '@1', confidence: 0.8, probabilities: { '@1': 0.5, none: 0.3 } }, 'a sum below tolerance')
-  // A malformed answer never reaches the click: readDecision stops there.
+  // A malformed answer never reaches the click: the retry carries no index.
   assert.ok(!('index' in decided(response({ choice: '@9', confidence: 0.9, probabilities: sure.probabilities }))))
 
   // A malformed Noul is not a number we can threshold, so it never becomes one.

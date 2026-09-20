@@ -175,8 +175,10 @@ One heredoc per round. Loop inside it, print one JSON object, exit.
      - credential needed        -> handOffTaskSpace, exit escalate
      - only commit remains      -> exit escalate
      - goal met                 -> exit done
-     - no candidate advances    -> retry once, then exit escalate
-     - otherwise                -> click the chosen target, continue
+     - no candidate advances    -> scroll one viewport if the page is worth
+                                   reading and unread below; otherwise retry
+                                   once, then exit escalate
+     - otherwise                -> reveal the target if off-screen, click it, continue
 5. guard: step budget, repeat page, ping-pong       code
 ```
 
@@ -202,11 +204,18 @@ step observes again immediately before acting, and:
 
 ### Blocked means no progress, not no navigation
 
-Three consecutive actions with no page change ends the round as `no_progress`. That counts
-what matters: a page that changed but did not advance is progress, and an action that changed
-nothing is not. It is tighter than the repeat-page guard, which catches leaving a page and
-coming back to it, and separate from ping-pong, which is about escalating twice on one
+Three consecutive actions with no observable change ends the round as `no_progress`. That
+counts what matters: a page that changed but did not advance is progress, and an action that
+changed nothing is not. It is tighter than the repeat-page guard, which catches leaving a page
+and coming back to it, and separate from ping-pong, which is about escalating twice on one
 fingerprint across rounds.
+
+Observable change is the fingerprint **or** the scroll position. The fingerprint is
+deliberately scroll-stable (fragment-free URL, sorted `label|count` pairs), because the loop
+scrolls on purpose and the repeat-page guard must not fire on every scroll — so an in-page
+anchor jump or a read-scroll counts on `pageInfo().sy` instead, above a small drift epsilon so
+a sticky header cannot fake progress forever. An in-page anchor click is how a docs site works;
+that is why it counts as progress rather than as a dead action.
 
 ## Candidate pruning
 
@@ -216,12 +225,21 @@ control.
 1. Keep interactive nodes only: buttons, links, inputs, selects, textareas, and anything with
    a click handler or an interactive ARIA role.
 2. Drop nodes with no visible text or label, unless they are inputs with a nearby label.
-3. Drop off-viewport nodes. Ref churn and noise both come from these.
-4. Deduplicate repeated labels; when several share a label, keep the first and note the count.
-5. Truncate each label to roughly 120 characters.
-6. Cap the list at 120 entries. The hard API ceiling is 255 Choice options; we stay well under
+3. **Keep off-screen nodes.** The list is pruned from the full page tree, never the viewport:
+   a collection agent's destination is usually below the fold of a long page (M1 measured the
+   old viewport filter deleting it in 8 of 9 failures, 1,208 of 1,251 refs on one page). Which
+   candidates are currently visible is a *hint* for acting — the loop scrolls a target into
+   view before clicking it — never a filter on the offer. The 120 cap, applied in DOM order,
+   is what keeps the list small, and that order is scroll-stable by construction.
+4. **Drop self-referential anchors.** A candidate whose url equals the current page's url
+   cannot change anything by being clicked — not the page, not the scroll position — so
+   offering it only invites the no-progress guard to clean up afterwards. Dropped before the
+   dedupe so a same-labelled sibling with a different target surfaces in its place.
+5. Deduplicate repeated labels; when several share a label, keep the first and note the count.
+6. Truncate each label to roughly 120 characters.
+7. Cap the list at 120 entries. The hard API ceiling is 255 Choice options; we stay well under
    because accuracy degrades as unrelated state grows.
-7. **Remove commit-like controls.** Any node whose text or `aria-label` matches
+8. **Remove commit-like controls.** Any node whose text or `aria-label` matches
    submit, send, post, publish, pay, buy, checkout, confirm, delete, remove, cancel order,
    unsubscribe, or a bare right-arrow, and any `input[type=submit]`.
 
@@ -292,11 +310,15 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | Signal | Threshold | Action |
 |---|---|---|
 | `goal_met.noul` | >= 0.8 | exit done |
-| `next_target.confidence` | < 0.5 | retry once with a tighter candidate list, then escalate |
+| `next_target.confidence` | < 0.5 | retry once over the same list, then escalate |
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
-| `cannot_choose.noul` | > 0.6 | retry once, then escalate |
+| `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
+| `worth_reading.noul` | > 0.5 | with a retry pending: scroll one viewport before spending it, max 3 per page |
 | `only_commit_remains.noul` | > 0.5 | exit escalate |
 | any field `choice` confidence | < 0.6 | leave the field, report it in `needs_input` |
+
+A malformed `choice` answer gets the same one retry before escalating as `invalid_response`,
+so a self-disagreeing answer costs a re-ask rather than a round.
 
 ## Exit contract
 
@@ -534,9 +556,13 @@ converges and one that spins.
    it be? A free sentence versus `{task, target, fields}` changes the questions.
 3. ~~Real page fingerprint cost.~~ **Resolved.** Hashing the pruned candidate list is cheap and
    stable, but only if the hash is *ref-free*: `@N` refs are CDP backend node ids, so a
-   re-render can renumber them and the guard would never fire. The fingerprint is
-   `sha256(url + label|count pairs)`, and `scripts/prune.js` checks that a re-render with every
-   ref renumbered hashes identically.
+   re-render can renumber them and the guard would never fire. It also has to be
+   *scroll-stable* once the loop scrolls on purpose, so the URL is hashed without its fragment
+   and the pairs in sorted order — a pure scroll at a fixed URL cannot move the hash. (An
+   in-page anchor jump still can, through the offer set: the self-anchor the prune drops
+   differs by position, and a different offer is a new decision context.) The fingerprint is
+   `sha256(fragment-free url + sorted label|count pairs)`, and `scripts/prune.js` checks that a
+   re-render with every ref renumbered, an anchor jump, and a reordering all hash identically.
 4. `serverFetch`'s exact return shape is not documented clearly enough to rely on. Use global
    `fetch` for the TypeSafe call, which is confirmed present.
 5. ~~When packaged as a skill, does Claude Code reliably pass the absolute skill root into the
