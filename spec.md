@@ -217,6 +217,13 @@ anchor jump or a read-scroll counts on `pageInfo().sy` instead, above a small dr
 a sticky header cannot fake progress forever. An in-page anchor click is how a docs site works;
 that is why it counts as progress rather than as a dead action.
 
+A return to a decided page is a **revisit**, not a stall (#10, refined in #11). The repeat-page
+guard grants one re-decision per fingerprint, spends the outbound and inbound paths **by target
+url, not label** — twins share a label, and label-keyed spending deleted the real section anchor
+in task 5 — and a granted revisit reads one viewport deeper before it re-decides when the page
+is worth reading, under the same per-page scroll limit. A second return is a real
+`repeat_page` escalate.
+
 ## Candidate pruning
 
 This runs in code before every Jev call. It is both the main accuracy lever and the safety
@@ -229,16 +236,24 @@ control.
    a collection agent's destination is usually below the fold of a long page (M1 measured the
    old viewport filter deleting it in 8 of 9 failures, 1,208 of 1,251 refs on one page). Which
    candidates are currently visible is a *hint* for acting — the loop scrolls a target into
-   view before clicking it — never a filter on the offer. The 120 cap, applied in DOM order,
-   is what keeps the list small, and that order is scroll-stable by construction.
+   view before clicking it — never a filter on the offer.
 4. **Drop self-referential anchors.** A candidate whose url equals the current page's url
    cannot change anything by being clicked — not the page, not the scroll position — so
-   offering it only invites the no-progress guard to clean up afterwards. Dropped before the
-   dedupe so a same-labelled sibling with a different target surfaces in its place.
-5. Deduplicate repeated labels; when several share a label, keep the first and note the count.
+   offering it only invites the no-progress guard to clean up afterwards.
+5. Deduplicate repeated label **and target url** pairs (#11): a label is not a destination,
+   and the same text pointing at two urls is a pair of twins — a docs page's cross-reference
+   and its real section anchor share a label — so each twin keeps its own seat and count.
+   Identical label *and* identical target collapse onto the first; url-less controls still
+   dedupe on the label alone.
 6. Truncate each label to roughly 120 characters.
-7. Cap the list at 120 entries. The hard API ceiling is 255 Choice options; we stay well under
-   because accuracy degrades as unrelated state grows.
+7. Cap the list at 120 entries, **with the page's own anchors taking the seats first** (#11):
+   when the cap binds on a monster page, candidates targeting the current page (url equal to
+   it up to the fragment, or fragment-only) come ahead of cross-page navigation, DOM order
+   within each group. A blind DOM-order slice keeps a monster page's sidebar and deletes its
+   own TOC — the measured way task 3 lost its destination. The hard API ceiling is 255 Choice
+   options; we stay well under because accuracy degrades as unrelated state grows. The
+   reordering is scroll-stable (urls do not move with the viewport) and fingerprint-invisible
+   (the fingerprint hashes sorted label|count pairs, not order).
 8. **Remove commit-like controls.** Any node whose text or `aria-label` matches
    submit, send, post, publish, pay, buy, checkout, confirm, delete, remove, cancel order,
    unsubscribe, or a bare right-arrow, and any `input[type=submit]`.
@@ -313,7 +328,7 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | `next_target.confidence` | < 0.5 | retry once over the same list, then escalate |
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
 | `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
-| `worth_reading.noul` | > 0.5 | with a retry pending: scroll one viewport before spending it, max 3 per page |
+| `worth_reading.noul` | > 0.5 | with a retry pending, or a granted revisit (#11): scroll one viewport before spending it, max 3 per page |
 | `only_commit_remains.noul` | > 0.5 | exit escalate |
 | any field `choice` confidence | < 0.6 | leave the field, report it in `needs_input` |
 
@@ -345,6 +360,7 @@ The `reason` is the vocabulary Claude Code branches on, and it is closed:
 | `only_commit_remains` | Every candidate was commit-like. Take over, or ask the user. |
 | `cannot_choose`, `low_confidence` | No candidate advances the goal, or the pick stayed shaky after the retry. |
 | `stale_page`, `no_progress`, `repeat_page`, `ping_pong` | The page kept moving under us, or the loop stopped converging. Nothing was collected. |
+| `start_url_mismatch` (#11) | The loop could not verify it is on `start_url` — a leftover tab from an earlier run is the measured cause. Read `detail`; re-run. |
 | `step_budget` | The budget ran out first. |
 | `invalid_response` | An answer failed validation, so nothing executed. |
 | `error`, `skill_root_not_found` | Our fault, not the page's: read `detail`. |

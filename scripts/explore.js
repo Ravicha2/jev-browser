@@ -72,16 +72,34 @@ const JOB_PATH = `${HOME}/.claude/jev-browser/job.json`
 
 // ---------------------------------------------------------------- pure control
 
-// The labels spent by a return: the click that left the page we are back on,
+// The paths spent by a return: the click that left the page we are back on,
 // and the click that brought us back. A collection agent returning from a
 // wrong cross-reference is recovery, not wandering — the repeat-page guard
 // grants one re-decision per fingerprint, and those two paths are exhausted.
-export function labelsToSpend(history) {
+// A path is a target url when the tree gave one, and only falls back to the
+// label for url-less controls (#11): a same-labelled twin — a docs page's
+// cross-reference and its real section anchor share the text — is a different
+// path, and spending the label spent both twins, which is how task 5 died.
+export function pathsToSpend(history) {
   return history
     .filter((entry) => typeof entry.decision === 'string' && entry.decision.startsWith('click'))
     .slice(-2)
-    .map((entry) => entry.label)
-    .filter(Boolean)
+    .map((entry) => ({ label: entry.label ?? null, url: entry.target_url ?? null }))
+    .filter((entry) => entry.label)
+}
+
+// The round is only ever about the page it started on. openOrReuseTab is
+// supposed to aim the tab at `start_url`, but #11's re-run measured the other
+// outcome: all 30 task-runs of three M1 runs read a module page left over
+// from an earlier run instead of the index, and the gate silently measured
+// from the wrong pages. So the start is verified on the same channel the loop
+// reads — pageInfo, not the tab's claimed url — and a round that did not land
+// on its start page says so instead of measuring the wrong site. Fragment and
+// a trailing slash are position, not identity.
+export function matchesStartUrl(observedUrl, startUrl) {
+  if (!observedUrl || !startUrl) return false
+  const clean = (url) => url.replace(/#.*$/, '').replace(/\/+$/, '') || '/'
+  return clean(observedUrl) === clean(startUrl)
 }
 
 // The guards that need no decision. Returns an exit object to stop, or null to
@@ -121,14 +139,18 @@ export function progressAfter({ lastFingerprint, lastSy, noProgress }, { fingerp
 // click, and never carried over from the decision step. The label is the stable
 // key, not the index or the ref: the list order can shift with the page's
 // scroll and refs belong to the snapshot that read them, but a deduped
-// candidate list carries each label exactly once. A page that moved to a
-// different fingerprint between the two observations is not acted on at all:
+// candidate list carries each label exactly once — per target, since #11, so
+// when a label names twins the `spent` predicate picks the live one and the
+// spent twin cannot be clicked by accident of DOM order. A page that moved to
+// a different fingerprint between the two observations is not acted on at all:
 // re-observe and re-ask. A stale ref is a misclick, so this is a safety
 // property, not just an accuracy one.
-export function resolveTarget(decision, observed, fresh) {
+export function resolveTarget(decision, observed, fresh, spent = null) {
   if (!observed || !fresh) return null
   if (fresh.fingerprint !== observed.fingerprint) return null
-  return fresh.candidates.find((candidate) => candidate.label === decision.label)?.ref ?? null
+  const byLabel = fresh.candidates.filter((candidate) => candidate.label === decision.label)
+  const alive = spent ? byLabel.filter((candidate) => !spent(candidate)) : byLabel
+  return (alive[0] ?? byLabel[0])?.ref ?? null
 }
 
 // What Jev gets of the history: where we went and what was clicked, in words. Not
@@ -238,18 +260,22 @@ export function readDecision({ response, candidates, retried }) {
 }
 
 // The scroll action (#10 change 2), decided in code and not by Jev, for the
-// two shapes a read-scroll answers: the answer for this page is a retry —
+// three shapes a read-scroll answers: the answer for this page is a retry —
 // nothing offered advances, or the pick stayed shaky — or it is a confident
 // pick that just proved dead (the same label, clicked, changed nothing: Jev is
-// stateless between steps and will name it again). Either way, when Jev also
-// says this page is one the goal asks us to read, the unread remainder below
-// the fold is a better bet than a third identical click or an escalation.
-// Serves `state.current_page` only; reachability is the candidate rule's job.
-// Bounded per page, because a 123-viewport page cannot be read a screen at a
-// time inside a step budget — long pages are served by their own TOC anchors,
-// which the candidate rule now offers.
-export function shouldScrollPage({ stuck, worthReading, moreBelow, scrolls }) {
-  return stuck === true
+// stateless between steps and will name it again) — or it is a granted revisit
+// (#11: task 1 died crossing between two pages that each held half the story,
+// both decided, neither read far enough, so a revisit now reads one viewport
+// deeper before it spends its re-decision). In every case, when Jev also says
+// this page is one the goal asks us to read, the unread remainder below the
+// fold is a better bet than a third identical click, a second guess at the
+// same screen, or an escalation. Serves `state.current_page` only;
+// reachability is the candidate rule's job. Bounded per page, because a
+// 123-viewport page cannot be read a screen at a time inside a step budget —
+// long pages are served by their own TOC anchors, which the candidate rule
+// now offers.
+export function shouldScrollPage({ stuck, revisit = false, worthReading, moreBelow, scrolls }) {
+  return (stuck === true || revisit === true)
     && worthReading > WORTH_READING
     && moreBelow
     && scrolls < PAGE_SCROLL_LIMIT
@@ -444,6 +470,15 @@ function exitObject({ status, reason, detail, step, steps, state, extra = {} }) 
   return { ...base, ...extra }
 }
 
+// The start-page half of matchesStartUrl, asked of the live browser.
+async function onTheStartPage(startUrl) {
+  try {
+    return matchesStartUrl((await pageInfo()).url, startUrl)
+  } catch {
+    return false
+  }
+}
+
 async function main() {
   if (!ROOT) {
     return exitObject({
@@ -463,6 +498,21 @@ async function main() {
 
   const task = await useOrCreateTaskSpace(job.task_space_id)
   await openOrReuseTab(job.start_url, { wait: true, timeout: 20 })
+  // One deliberate navigation retry, then a loud refusal: a round measured
+  // from the wrong page is worse than no round.
+  if (!(await onTheStartPage(job.start_url))) {
+    await gotoAndWait(job.start_url, { timeout: 20 })
+    if (!(await onTheStartPage(job.start_url))) {
+      return exitObject({
+        status: 'escalate',
+        reason: 'start_url_mismatch',
+        extra: {
+          goal: job.goal,
+          detail: `the start tab is at ${JSON.stringify((await pageInfo().catch(() => ({}))).url ?? 'unknown')}, not ${job.start_url}`,
+        },
+      })
+    }
+  }
 
   let steps = 0
   let retried = false
@@ -476,13 +526,44 @@ async function main() {
   const pageScrolls = new Map()
   // Re-decisions spent per fingerprint by the repeat-page guard.
   const revisits = new Map()
-  // Labels exhausted by the latest revisit-continue; offered to no ask until
-  // the next action retires them.
-  const spentFor = new Set()
+  // Paths exhausted by the latest revisit-continue; offered to no ask until
+  // the next action retires them. Urls when the tree gave one (#11: spending
+  // the label spent the twin too), labels only as the url-less fallback.
+  const spentUrls = new Set()
+  const spentLabels = new Set()
+  const spent = (candidate) => (candidate.url
+    ? spentUrls.has(candidate.url)
+    : spentLabels.has(candidate.label))
+  const anySpent = () => spentUrls.size > 0 || spentLabels.size > 0
 
   while (true) {
     steps += 1
-    const observed = await observe()
+    let observed = await observe()
+
+    // The start check rides on the loop's own observation channel (#11): a
+    // pre-loop pageInfo can pass and the round still observe a leftover tab
+    // (measured: three M1 runs read the previous run's module pages from step
+    // 1, silently, with the guard's check green). The first observation is
+    // the truth, so it gets the same verification: re-aim once, re-observe,
+    // then refuse loudly with the tab list in the detail.
+    if (steps === 1 && !matchesStartUrl(observed.url, job.start_url)) {
+      await gotoAndWait(job.start_url, { timeout: 20 })
+      const reobserved = await observe()
+      if (!matchesStartUrl(reobserved.url, job.start_url)) {
+        return exitObject({
+          status: 'escalate',
+          reason: 'start_url_mismatch',
+          step: steps,
+          state: reobserved,
+          extra: {
+            goal: job.goal,
+            detail: `the loop observes ${JSON.stringify(reobserved.url)}, not the start url ${job.start_url}`,
+            start_tabs: await listTabs().catch(() => null),
+          },
+        })
+      }
+      observed = reobserved
+    }
 
     // Moving on from a page we acted on makes that page visited, and coming back
     // to it later is the repeat-page guard. Staying on it is not a repeat — not
@@ -515,7 +596,10 @@ async function main() {
       if (seen < REVISIT_LIMIT) {
         revisits.set(observed.fingerprint, seen + 1)
         visited.delete(observed.fingerprint)
-        for (const label of labelsToSpend(history)) spentFor.add(label)
+        for (const path of pathsToSpend(history)) {
+          if (path.url) spentUrls.add(path.url)
+          else spentLabels.add(path.label)
+        }
         revisitPending = true
       } else {
         return exitObject({
@@ -541,14 +625,17 @@ async function main() {
     // tighter slice truncated in DOM order, which on a full-tree list deletes
     // the destination (measured: task 3's answer sat beyond entry 20, and the
     // tightened re-ask exited cannot_choose over a list that no longer held it).
-    const candidates = spentFor.size > 0
-      ? observed.candidates.filter((candidate) => !spentFor.has(candidate.label))
+    // Spent paths are the only subtraction, and by target, not label (#11).
+    const candidates = anySpent()
+      ? observed.candidates.filter((candidate) => !spent(candidate))
       : observed.candidates
     const questions = buildQuestions(candidates)
     const state = fitState({
       goal: job.goal,
       current_page: observed.pageText.slice(0, MAX_PAGE_CHARS),
-      candidates,
+      // ref, label, count are all Jev gets of a candidate: the target url is
+      // for code (spending), never for the request.
+      candidates: candidates.map(({ ref, label, count }) => ({ ref, label, count })),
       trail: trailForJev(history),
     }, questions)
 
@@ -613,12 +700,16 @@ async function main() {
     // holds the label of the most recent click and is cleared whenever the
     // page last changed, so `deadRepeat` is true only when the identical pick
     // has already failed to move anything. Jev is stateless between steps and
-    // will happily name the same dead target again; code breaks the tie.
+    // will happily name the same dead target again; code breaks the tie. A
+    // granted revisit reads first for the same reason: the re-decision is the
+    // one thing the guard still owes this page, and spending it on the same
+    // screen is how task 1 died (#11).
     const scrolls = pageScrolls.get(observed.fingerprint) ?? 0
     const deadRepeat = progress.noProgress >= 1 && lastAction?.label === decision.label
     const stuck = decision.kind === 'retry' || (decision.kind === 'click' && deadRepeat)
     if (shouldScrollPage({
       stuck,
+      revisit: revisitPending,
       worthReading: readNoul(response, 'worth_reading'),
       moreBelow: await moreBelow(observed),
       scrolls,
@@ -626,7 +717,7 @@ async function main() {
       const to = Math.round(observed.sy + await js('window.innerHeight'))
       await js(`window.scrollTo(0, ${to})`)
       pageScrolls.set(observed.fingerprint, scrolls + 1)
-      recorded(`scroll to ${to}`)
+      recorded(`${revisitPending ? 'revisit-' : ''}scroll to ${to}`)
       progress.lastFingerprint = observed.fingerprint
       progress.lastSy = observed.sy
       continue
@@ -641,9 +732,9 @@ async function main() {
 
     // Act. Both observations are fresh, so a page that moved between deciding and
     // acting is not clicked at all, and the ref is read from the snapshot taken
-    // immediately before the click.
+    // immediately before the click. A spent twin is skipped at the label.
     const fresh = await observe()
-    const target = resolveTarget(decision, observed, fresh)
+    const target = resolveTarget(decision, observed, fresh, anySpent() ? spent : null)
     if (!target) {
       stale += 1
       const trail = recorded(`stale:${decision.label}`)
@@ -683,10 +774,19 @@ async function main() {
     await wait(SETTLE_SECONDS)
 
     // Record the action before the next observation, so a stale post-action
-    // snapshot cannot erase the record of something that did happen.
+    // snapshot cannot erase the record of something that did happen. The
+    // target url rides along under its own name — `url` is the observed page
+    // and must stay that (spreading a target over it once misread every trail
+    // in the #11 re-run as a wrong start) — so a later revisit can spend the
+    // path by target (#11).
     recorded(
       `click ${target}`,
-      { label: decision.label, ...(revealed ? { revealed: true } : {}), ...(clickError ? { error: clickError } : {}) },
+      {
+        label: decision.label,
+        target_url: candidates[decision.index]?.url ?? null,
+        ...(revealed ? { revealed: true } : {}),
+        ...(clickError ? { error: clickError } : {}),
+      },
     )
 
     // The page this action was taken from, awaiting its post-action observation.
@@ -696,7 +796,8 @@ async function main() {
     progress.lastSy = fresh.sy
     lastAction = { label: decision.label }
     retried = false
-    spentFor.clear()
+    spentUrls.clear()
+    spentLabels.clear()
   }
 }
 
@@ -764,13 +865,43 @@ async function runSelfCheck() {
   )
   assert.equal(resolveTarget({ index: 4, label: 'x' }, observed, observed), null, 'a label that was never offered')
 
+  // The start guard (#11): fragment and a trailing slash are position, not
+  // identity; a leftover module page is not the start, whatever aimed the tab.
+  assert.equal(matchesStartUrl('https://x.io/docs/api/', 'https://x.io/docs/api'), true, 'a trailing slash is not a page')
+  assert.equal(matchesStartUrl('https://x.io/docs/api#top', 'https://x.io/docs/api'), true, 'a fragment is not a page')
+  assert.equal(matchesStartUrl('https://x.io/docs/api/sqlite.html', 'https://x.io/docs/api'), false, 'a leftover module page is not the start')
+  assert.equal(matchesStartUrl('https://x.io/other', 'https://x.io/docs/api'), false, 'a different page is not the start')
+  assert.equal(matchesStartUrl(null, 'https://x.io/'), false, 'no observation, no match')
+
+  // A label can name twins (#11): the spent one — the cross-reference a hop
+  // just proved wrong — is skipped, and the live twin is clicked.
+  const twins = {
+    fingerprint: fp,
+    candidates: [
+      { ref: '@1', label: 'Usage and example', url: 'https://docs.example/synopsis.html' },
+      { ref: '@2', label: 'Usage and example', url: 'https://docs.example/cluster.html#usage' },
+    ],
+  }
+  const spentCrossRef = (candidate) => candidate.url === 'https://docs.example/synopsis.html'
+  assert.equal(
+    resolveTarget({ index: 1, label: 'Usage and example' }, twins, twins, spentCrossRef),
+    '@2',
+    'a spent twin is skipped at the label',
+  )
+  assert.equal(
+    resolveTarget({ index: 1, label: 'Usage and example' }, twins, twins),
+    '@1',
+    'without spending, DOM order picks the twin',
+  )
+
   // The read-scroll: a stuck answer (a retry, or a confident pick that just
-  // proved dead) on a page worth reading that still has content below the
-  // fold, and never more than the per-page limit.
+  // proved dead) or a granted revisit (#11), on a page worth reading that
+  // still has content below the fold, and never more than the per-page limit.
   const scrollCase = { stuck: true, worthReading: 0.9, moreBelow: true, scrolls: 0 }
   assert.ok(shouldScrollPage(scrollCase), 'a stuck read scrolls')
   assert.ok(!shouldScrollPage({ ...scrollCase, stuck: false }), 'a live pick is not intercepted')
-  assert.ok(!shouldScrollPage({ ...scrollCase, worthReading: 0.4 }), 'navigation is not scrolled')
+  assert.ok(shouldScrollPage({ ...scrollCase, stuck: false, revisit: true }), 'a granted revisit reads first')
+  assert.ok(!shouldScrollPage({ ...scrollCase, stuck: false, revisit: true, worthReading: 0.4 }), 'navigation is not scrolled on a revisit either')
   assert.ok(!shouldScrollPage({ ...scrollCase, moreBelow: false }), 'nothing below the fold')
   assert.ok(!shouldScrollPage({ ...scrollCase, scrolls: PAGE_SCROLL_LIMIT }), 'the per-page limit holds')
 
@@ -786,17 +917,27 @@ async function runSelfCheck() {
   assert.equal(trailForJev(Array.from({ length: 40 }, (_, index) => ({ step: index }))).length, TRAIL_STEPS)
 
   // A revisit spends the path out and the path back — clicks only, so scrolls
-  // and retries around the departure do not burn unrelated labels.
+  // and retries around the departure do not burn unrelated paths — and a path
+  // is a target url when there is one, so a same-labelled twin survives the
+  // spending (#11, task 5).
   assert.deepEqual(
-    labelsToSpend([
-      { step: 1, decision: 'click @1', label: 'Cluster' },
+    pathsToSpend([
+      { step: 1, decision: 'click @1', label: 'Cluster', target_url: 'https://docs.example/cluster.html' },
       { step: 2, decision: 'scroll to 900' },
-      { step: 3, decision: 'click @2', label: 'Usage and example' },
-      { step: 4, decision: 'click @3', label: 'Cluster' },
+      { step: 3, decision: 'click @2', label: 'Usage and example', target_url: 'https://docs.example/synopsis.html' },
+      { step: 4, decision: 'click @3', label: 'Cluster', target_url: 'https://docs.example/cluster.html' },
     ]),
-    ['Usage and example', 'Cluster'],
+    [
+      { label: 'Usage and example', url: 'https://docs.example/synopsis.html' },
+      { label: 'Cluster', url: 'https://docs.example/cluster.html' },
+    ],
   )
-  assert.deepEqual(labelsToSpend([{ step: 1, decision: 'retry:low_confidence' }]), [], 'no clicks, nothing spent')
+  assert.deepEqual(
+    pathsToSpend([{ step: 1, decision: 'click @9', label: 'Back' }]),
+    [{ label: 'Back', url: null }],
+    'a url-less click spends its label',
+  )
+  assert.deepEqual(pathsToSpend([{ step: 1, decision: 'retry:low_confidence' }]), [], 'no clicks, nothing spent')
 
   // The request shaves the page before the questions.
   const questions = buildQuestions([{ ref: '@1', label: 'x'.repeat(200) }])

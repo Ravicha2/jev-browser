@@ -11,8 +11,10 @@
 // nodejs.org's cli.html, leaving 37 sidebar links). So the viewport is now a
 // hint, never a filter: candidates come from the full page tree, and which of
 // them are off-screen is reported (the loop scrolls a target into view before
-// clicking it) but never removes one from the list. The 120 cap still binds, in
-// DOM order, which is what keeps the list scroll-invariant.
+// clicking it) but never removes one from the list. The 120 cap still binds
+// (#11: when it does, the page's own anchors take the seats first — a monster
+// page's TOC is the destination list, its sidebar is navigation), which is
+// what keeps the list scroll-invariant: urls do not move with the viewport.
 //
 // Pure text in, JSON out. No browser, no network, which is what makes the trust
 // boundary checkable from a fixture:
@@ -107,8 +109,9 @@ export function pruneCandidates(snapshotText, options) {
 // currentUrl drops self-referential anchors: a candidate whose url is exactly
 // the current page's url cannot change anything by being clicked — not the
 // page, not the scroll position — so offering it only invites the no-progress
-// guard to clean up afterwards. Dropped before the dedupe so a same-labelled
-// sibling with a different target surfaces in its place.
+// guard to clean up afterwards. Dropped before the dedupe; a same-labelled
+// twin with a different target keeps its own seat under the url-aware key
+// either way (#11).
 export function pruneDetail(snapshotText, { visibleRefs = [], currentUrl = null } = {}) {
   const lines = parseSnapshot(snapshotText)
   const visible = new Set(visibleRefs.map(String))
@@ -140,25 +143,50 @@ export function pruneDetail(snapshotText, { visibleRefs = [], currentUrl = null 
 
     const label = texts.find((value) => value.trim())
     if (!label) continue
-    kept.push({ ref: `@${node.ref}`, label, texts: texts.join(' '), loc: node.loc || '' })
+    kept.push({ ref: `@${node.ref}`, label, texts: texts.join(' '), loc: node.loc || '', url: node.url ?? null })
   }
 
-  // 4. dedupe repeated labels, keeping the first and its count.
+  // 4. dedupe repeated labels, keeping the first and its count. A label is not
+  // a destination (#11): the same text pointing at two urls is a pair of twins
+  // — a docs page's cross-reference and its real section anchor share a label —
+  // so the key is label AND target url, and each twin keeps its own seat and
+  // count. Url-less controls (buttons, inputs) fall back to the label alone,
+  // which is the old behaviour for them.
   const unique = new Map()
   for (const candidate of kept) {
-    const seen = unique.get(candidate.label)
+    const key = `${candidate.label}\u0000${candidate.url ?? ''}`
+    const seen = unique.get(key)
     if (seen) seen.count += 1
-    else unique.set(candidate.label, { ...candidate, count: 1 })
+    else unique.set(key, { ...candidate, count: 1 })
   }
 
-  // 5. truncate, 6. cap, 7. the trust boundary follows in `allowed`. Only ref, label and
-  // count go to Jev; loc and the raw texts were for matching, not for sending.
-  const capped = [...unique.values()].slice(0, MAX_CANDIDATES)
+  // 5. truncate, 6. cap with same-page seats first, 7. the trust boundary
+  // follows in `allowed`. Only ref, label and count go to Jev; loc, the raw
+  // texts and the url were for matching and spending, not for sending.
+  //
+  // The cap's order (#11, task 3 of the M1 re-run): measured on nodejs.org's
+  // cli.html the full tree yields more uniques than the cap keeps, and a blind
+  // DOM-order slice keeps the sidebar and deletes the page's own TOC — the
+  // exact place a "which flag" goal's destination lives. Candidates targeting
+  // the current page (url equal to it up to the fragment, or a fragment-only
+  // url) take the seats first, DOM order within each group, cross-page
+  // navigation after. Without a currentUrl there is no promotion: pure DOM
+  // order, as before.
+  const here = currentUrl ? currentUrl.replace(/#.*$/, '') : null
+  const ownPage = []
+  const crossPage = []
+  for (const candidate of unique.values()) {
+    const same = here && candidate.url
+      && (candidate.url.startsWith('#') || candidate.url.replace(/#.*$/, '') === here)
+    ;(same ? ownPage : crossPage).push(candidate)
+  }
+  const capped = [...ownPage, ...crossPage].slice(0, MAX_CANDIDATES)
   const allowed = capped.filter((candidate) => !isCommitLike(candidate))
   const candidates = allowed.map((candidate) => ({
     ref: candidate.ref,
     label: truncate(candidate.label),
     count: candidate.count,
+    ...(candidate.url ? { url: candidate.url } : {}),
   }))
   return {
     candidates,
@@ -252,32 +280,56 @@ async function selfCheck() {
   // A bare input keeps the label of the text line above it.
   assert.equal(candidates[0].label, 'VAT number')
 
-  // Duplicates collapse onto the first, with a count.
+  // Duplicates collapse onto the first, with a count — but a label is not a
+  // destination (#11): the two "Read more" anchors point at r/1 and r/2, so
+  // both keep a seat, each with its own count.
   assert.deepEqual(
-    candidates.find((candidate) => candidate.label === 'Read more'),
-    { ref: '@27', label: 'Read more', count: 2 },
+    candidates.find((candidate) => candidate.ref === '@27'),
+    { ref: '@27', label: 'Read more', count: 1, url: 'https://shop.example.com/r/1' },
+  )
+  assert.deepEqual(
+    candidates.find((candidate) => candidate.ref === '@28'),
+    { ref: '@28', label: 'Read more', count: 1, url: 'https://shop.example.com/r/2' },
+    'a same-labelled twin with a different target keeps its own seat',
   )
 
   // A self-referential anchor is a guaranteed no-op click, so it never reaches
-  // Jev; dropped before the dedupe, its same-labelled sibling with a different
-  // target surfaces in its place.
+  // Jev. Its twin keeps the seat it already had.
   const elsewhere = pruneCandidates(snapshot, { currentUrl: 'https://shop.example.com/r/1' })
   assert.deepEqual(
     elsewhere.find((candidate) => candidate.label === 'Read more'),
-    { ref: '@28', label: 'Read more', count: 1 },
-    'the anchor we are sitting on is dropped, its sibling surfaces',
+    { ref: '@28', label: 'Read more', count: 1, url: 'https://shop.example.com/r/2' },
+    'the anchor we are sitting on is dropped, its twin stays',
   )
-  assert.equal(elsewhere.length, candidates.length, 'a same-label sibling keeps the seat')
+  assert.equal(elsewhere.length, candidates.length, 'the dropped seat is refilled from below the cutoff')
+  assert.ok(elsewhere.some((candidate) => candidate.label === 'Result 111'), 'the refill is the next DOM entry')
   assert.ok(!elsewhere.some((candidate) => candidate.ref === '@27'), 'the no-op ref is gone')
 
-  // Truncation, and the cap. 149 unique labels -> 120 kept in DOM order -> 4
-  // commit controls removed. "Far away button" now takes one of the 120 ahead
-  // of the Results, so the cutoff lands one entry earlier than before the fix.
+  // Truncation, and the cap. 150 unique label|url pairs -> 120 kept in DOM
+  // order (the second "Read more" takes a seat, so the cutoff moves back one)
+  // -> 4 commit controls removed.
   const long = candidates.find((candidate) => candidate.label.endsWith('…'))
   assert.ok(long && long.label.length === MAX_LABEL_CHARS, 'long label not truncated to 120')
-  assert.equal(candidates.length, 116, 'cap: 149 entries -> 120 -> 4 commit controls removed')
-  assert.ok(labels.includes('Result 111') && !labels.includes('Result 112'), 'cap kept the wrong entries')
+  assert.equal(candidates.length, 116, 'cap: 150 entries -> 120 -> 4 commit controls removed')
+  assert.ok(labels.includes('Result 110') && !labels.includes('Result 111'), 'cap kept the wrong entries')
   assert.ok(candidates.length <= MAX_CANDIDATES)
+
+  // Same-page seats under the cap (#11, task 3's shape): a monster page whose
+  // own TOC anchors come late in the DOM. With the current url known, the
+  // page's own entry survives the cap and a cross-page nav entry pays for the
+  // seat; on any other page the same entry is capped out in DOM order.
+  const monster = [
+    'root',
+    ...Array.from({ length: 125 }, (_, index) => `  anchor "Nav ${index + 1}" [ref=${1000 + index}, loc=href:/nav/${index + 1}, url=https://shop.example.com/nav/${index + 1}]`),
+    '  anchor "Own late section" [ref=2001, loc=href:/page#own, url=https://shop.example.com/page#own]',
+  ].join('\n')
+  const onPage = pruneCandidates(monster, { currentUrl: 'https://shop.example.com/page' })
+  assert.ok(onPage.some((candidate) => candidate.label === 'Own late section'), 'the page own TOC entry survives the cap')
+  assert.ok(!onPage.some((candidate) => candidate.label === 'Nav 125'), 'a cross-page nav entry paid for the seat')
+  assert.equal(onPage.length, 120, 'the cap itself is untouched')
+  const offPage = pruneCandidates(monster, { currentUrl: 'https://shop.example.com/other' })
+  assert.ok(!offPage.some((candidate) => candidate.label === 'Own late section'), 'without the promotion the late entry is capped out')
+  assert.ok(offPage.some((candidate) => candidate.label === 'Nav 120'), 'DOM order holds when the page does not match')
 
   // Fingerprint stability: the same page re-rendered with every ref renumbered
   // is the same page, and so is the same page scrolled (a fragment-only URL

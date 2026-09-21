@@ -403,3 +403,80 @@ bigger. At $0.042/Mtok that is ~$0.015 per task — still not a constraint.
 | `PAGE_SCROLL_LIMIT` | 3 | Higher reads deeper into monsters; costs steps | Fired in tasks 1 and 3; 3 viewports cannot cover an 84k px page — the TOC anchors are the real mechanism there, and the cap keeps the loop from grinding. |
 | `PROGRESS_SY_EPSILON` | 8 px | Smaller misfires on jitter; larger ignores real scrolls | No false progress across 138 steps (zero `no_progress` exits). |
 | `REVISIT_LIMIT` | 1 | Higher tolerates more wandering | 4 fires in the record run; task 4's `done` went through a revisit. The second `repeat_page` (task 1) is a true stop. |
+
+## The re-measurement (#11): residuals batched
+
+Three of #10's four residuals, one slice, all code-local: revisit spending keyed by
+**target url instead of label** (with the dedupe key widened to label + target url, so a
+same-labelled twin keeps its own seat and can be clicked); a granted revisit **reads one
+viewport before it re-decides** (same `worth_reading` gate and `PAGE_SCROLL_LIMIT` as the
+stuck-scroll); and the cap now gives **the page's own anchors the seats first** when it
+binds, so a monster page's TOC survives its own sidebar. `MAX_CANDIDATES` stays 120. The
+fourth residual (task 10, ranking at list size) was watch-only — and is gone: with the
+TOC promoted, `--inspect-wait` is picked cleanly in both runs.
+
+Also caught in this slice, and worth its own line because it once invalidated a whole
+analysis: a click's trail row now carries the click's **`target_url`** beside the observed
+page `url`. An earlier draft spread the target over `url`, which made every run read as if
+it had started on the previous run's last page. The start is now also *verified*, not
+assumed: `matchesStartUrl` checks the first observation against `start_url`, re-aims once,
+then escalates `start_url_mismatch` with the tab list in `detail`. Three pre-#11 task-runs
+genuinely did inherit a leftover tab; no run since has.
+
+Runs of record: `~/.claude/jev-browser/runs/m1-2026-09-21T04-28-34/` and
+`.../m1-2026-09-21T04-32-30/`. Two runs, not three: the first pair disagreed only on task 9
+(one flake), and the marginal third run was not worth its tokens. `jev-1.13.0` answered
+every step of both.
+
+### Per-task, both runs
+
+| # | goal (short) | run 1 | run 2 | steps | rate | wall | in tok |
+|---|---|---|---|---|---|---|---|
+| 1 | `--inspect` host:port | escalate `low_confidence` | escalate `low_confidence` | 7 | 0.29 | ~28s | 57,092 |
+| 2 | `node:sqlite` version+stability | done | done | 3 | 0.00 | ~19s | 23,343 |
+| 3 | strip-types flag rename | escalate `cannot_choose` | escalate `cannot_choose` | 5 | 0.40 | ~16s | 42,008 |
+| 4 | Permission Model modes | done | done | 3 | 0.00 | ~13s | 21,942 |
+| 5 | cluster worker count | **done** | **done** | 6 | 0.00 | ~17s | 46,299 |
+| 6 | `node:sqlite` sync class | done | done | 2 | 0.00 | ~9s | 14,517 |
+| 7 | `maxBuffer` limits/default | escalate `low_confidence` | escalate `low_confidence` | 5 | 0.40 | ~20s | 40,646 |
+| 8 | test runner watch mode | done | done | 3 | 0.00 | ~19s | 23,337 |
+| 9 | FS permissions default | escalate `cannot_choose` | **done** | 3 | 0.33 | ~10s | 23,990 |
+| 10 | `--inspect-wait` version | **done** | **done** | 3.5 | 0.13 | ~13s | 26,759 |
+
+(The two runs are near-byte-identical per task — the pin is paying off. Only tasks 9 and 10
+differ, and only in the last step or the retry count.)
+
+| Run | Done | Steps | Escalation rate | Input tokens |
+|---|---|---|---|---|
+| record 1 (`04-28-34`) | 6/10 | 40 | 0.200 | 319,151 |
+| record 2 (`04-32-30`) | 7/10 | 41 | 0.171 | 320,715 |
+| pooled | **13/20** | 81 | **0.185** | 639,866 |
+
+### The gate, third reading
+
+**Continue.** Escalation 0.185 pooled, under the ~20% line; 13 of 20 task-runs reach
+`done`, against #10's 18 of 30 (0.60 vs 0.65). The two residuals this slice targeted are
+fixed: task 5's twin-spending and task 10's ranking are `done` in both runs, and task 3's
+destination is provably offered now — the trail shows the loop clicks `#--no-strip-types`
+itself. Task 1 no longer ping-pongs; the revisit reads instead of re-crossing.
+
+### What still fails, and the honest cost
+
+Tasks 1, 3, and 7 (and task 9's one flake) now share **one** shape, and it is not
+navigation: the loop reaches the right page *and the right section anchor* —
+`#inspectoropenport-host-wait`, `#--no-strip-types`, `#maxbuffer-and-unicode` — and then
+cannot close. `goal_met` stays under 0.8 on a page that holds part of the answer, and the
+next pick goes shaky among the remaining lookalike anchors. That is the extraction family:
+`goal_met` returns a probability, not a value, and the loop has no `answer_span`/`has_answer`
+question yet. It is #9's slice, by design.
+
+Task 7 deserves its own line, because it is a real regression against #10 (3/3 `done`
+there, 0/2 here): the promotion that fixed task 3 also changed which anchor Jev picks
+first on `child_process.html` — the `maxBuffer and Unicode` section, which states the
+truncation behaviour but not the default value, ahead of `exec()`'s option list, which
+states both. A literal-reading model correctly refuses `goal_met` on a half-answer. The
+fix is not to un-promote; it is extraction (#9) plus, if it recurs, letting the pick prefer
+the candidate whose label names the *field* over the one that names an *adjacent concern*.
+
+The cost, unchanged in kind: input tokens ~320k per run (bigger lists, more grounding per
+ask), ~$0.013 per task at $0.042/Mtok. Still not a constraint.
