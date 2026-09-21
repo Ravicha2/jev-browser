@@ -310,8 +310,9 @@ cookbook shape:
 'field_vat_number_stated': { type: 'noul',   instructions: 'Does `goal` mention a VAT number?' },
 ```
 
-The companion Noul is what keeps the request small and prevents forced guesses: when it reads
-low, code omits the field and moves on instead of filling something wrong.
+The companion Noul is what keeps the request small and prevents forced guesses: when it
+reads low, code omits the field and reports it in `needs_input` instead of filling
+something wrong (#7).
 
 ## Confidence
 
@@ -330,7 +331,7 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
 | `worth_reading.noul` | > 0.5 | with a retry pending, or a granted revisit (#11): scroll one viewport before spending it, max 3 per page |
 | `only_commit_remains.noul` | > 0.5 | exit escalate |
-| any field `choice` confidence | < 0.6 | leave the field, report it in `needs_input` |
+| any field `choice` confidence | < 0.5 | leave the field, report it in `needs_input` |
 
 A malformed `choice` answer gets the same one retry before escalating as `invalid_response`,
 so a self-disagreeing answer costs a re-ask rather than a round.
@@ -351,6 +352,13 @@ anyway.
 Needs_input means "I can proceed, but I need a value I do not have," and it names the value so
 Claude Code's reply is cheap.
 
+In a `needs_input`, `field` is the page field's label folded to a slug — `VAT number`
+becomes `vat_number` — and that slug is the key the caller answers under in
+`supplied_values`. `wants` is assembled in code from the same label, because Jev cannot
+generate text: the label is page content code copied, exactly like a finding's evidence
+span (#7). One field is named per round; a form with several unknown values converges
+over rounds.
+
 The `reason` is the vocabulary Claude Code branches on, and it is closed:
 
 | Reason | Means |
@@ -363,6 +371,7 @@ The `reason` is the vocabulary Claude Code branches on, and it is closed:
 | `start_url_mismatch` (#11) | The loop could not verify it is on `start_url` — a leftover tab from an earlier run is the measured cause. Read `detail`; re-run. |
 | `step_budget` | The budget ran out first. |
 | `invalid_response` | An answer failed validation, so nothing executed. |
+| `no_values` (#7) | `supplied_values` in job.json is present but not an object of strings — a caller bug, not a page problem. An *empty or missing* `supplied_values` is not this: the loop asks for the fields by name. |
 | `error`, `skill_root_not_found` | Our fault, not the page's: read `detail`. |
 
 Every escalate carries `step` and `page_fingerprint`, and the loop adds `goal`, `model`,
@@ -425,11 +434,12 @@ because the heredoc's working directory is not the caller's:
 ```json
 {
   "task_space_id": 3,
-  "goal": "find the VAT registration number on the account page",
-  "start_url": "https://example.com/account",
-  "supplied_values": { "vat_number": "IE1234567X" },
-  "step_budget": 12,
-  "visited_fingerprints": ["a1b2c3"],
+  "goal": "fill the company registration form from the user's details",
+  "start_url": "https://example.com/register",
+  "supplied_values": { "vat_number": "IE1234567X", "search_query": "" },
+  "step_budget": 20,
+  "settled_refs": ["@20", "vat_number"],
+  "visited_fingerprints": ["a1b2c3:vat_number"],
   "escalated_fingerprints": []
 }
 ```
@@ -439,11 +449,27 @@ const job = JSON.parse(readFileSync(`${process.env.HOME}/.claude/jev-browser/job
 const task = await useOrCreateTaskSpace(job.task_space_id)
 ```
 
-`visited_fingerprints` is carried across rounds so the repeat-page guard still works after a
-resume, and `escalated_fingerprints` is what the ping-pong guard reads. A round reports the
-fingerprint it escalated on in its exit object; the caller records it when it rewrites
-`job.json`, because the loop never writes the job file it was handed. Nothing is passed through
-the shell, so a goal string containing quotes, backticks, or newlines cannot break the
+**The needs_input round trip (#7).** A field the loop cannot value — its companion Noul
+read low, the choice answered `none`, the pick was shaky, or `supplied_values` is empty —
+exits `needs_input` naming one field: `field` (the slug), `wants` (what to supply), and
+`page_fingerprint`. The caller answers by adding `"field": "value"` to `supplied_values`,
+appending `<page_fingerprint>:<field>` to `visited_fingerprints`, and re-invoking with the
+same `task_space_id`; ego-browser resumes the space, so the page and everything already
+typed into it survive. An empty string as the value settles the field as intentionally
+empty — how an optional field the goal does not need leaves the loop instead of deadlocking
+it. On the resumed round the answer is a **direct fill**: a supplied value keyed to the
+field's own slug is Claude Code's judgment, not Jev's, so code fills it without an ask —
+the companion Noul that caused the ask is not consulted on its own answer, which is what
+makes round 2 converge instead of re-asking. One field per round; `settled_refs` carries
+the refs the loop filled plus the slugs settled empty, so a resumed run neither refills nor
+re-asks.
+
+`visited_fingerprints` is carried across rounds so the ping-pong guard still works after a
+resume, and `escalated_fingerprints` is what the ping-pong guard reads for escalations. A
+round reports the fingerprint it stopped on in its exit object; the caller records it when
+it rewrites `job.json`, because the loop never writes the job file it was handed. Nothing
+is passed through the shell — the goal and the answer travel only inside `job.json` and
+JSON bodies — so a goal string containing quotes, backticks, or newlines cannot break the
 invocation.
 
 ## Packaging as a skill
@@ -562,6 +588,16 @@ and a `page_fingerprint` (a hash of the pruned candidate list plus the URL), and
 refuses to escalate twice on the same fingerprint. On the second attempt it goes straight to
 `needs_input`, or gives up. A few lines, and it is the difference between a loop that
 converges and one that spins.
+
+The form loop (#7) runs the same guard across its own round boundary, with one refinement:
+a `needs_input` ask is recorded as `<page_fingerprint>:<field>`, not as a bare fingerprint.
+A bare fingerprint cannot tell "the caller's answer did not unblock this field" — a
+ping-pong, and the resumed round escalates `ping_pong` instead of asking forever — from
+"this page has a second unknown field" — the next legitimate question, which still asks.
+Escalations record the bare fingerprint in `escalated_fingerprints`; a repeat escalation
+exits `ping_pong` with the original trigger named in `detail`. Both lists live in
+`job.json`, written only by the caller: a caller that has genuinely changed the situation
+clears the entry it addressed, because the file is its side of the contract.
 
 ## Open questions to verify before M2
 

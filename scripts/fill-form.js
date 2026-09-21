@@ -1,31 +1,45 @@
-// jev-browser form-filling loop (issue #6; spec.md "Core decisions" 2 and 4).
+// jev-browser form-filling loop (issues #6 and #7; spec.md "Core decisions" 2
+// and 4, "Resume protocol").
 //
-// First cut: put a supplied value into the right field and stop. Jev picks the
-// field and picks which supplied value belongs in it; it never generates the
-// value, because it is not trained to generate text. The values are a closed
-// set supplied in job.json, and code does the fillInput.
+// Put supplied values into the right fields and stop. Jev picks the field and
+// picks which supplied value belongs in it; it never generates the value,
+// because it is not trained to generate text. The values are a closed set
+// supplied in job.json, and code does the fillInput.
 //
 // Same loop shape as explore.js, with per-field questions instead of
 // `next_target`: one `choice` per fillable field over the supplied values plus
 // `none`, and one companion Noul asking whether the goal mentions that field at
-// all. A field whose companion Noul reads low is left alone rather than filled
-// wrong, and so is a field that answers `none` or picks shakily. An unfilled
-// field is a finding; a wrongly filled one is damage.
+// all. A field whose companion Noul reads low is not filled — and since #7 it
+// is not silently dropped either: the round exits `needs_input` naming the
+// field and what it wants, rather than guessing. Claude Code answers by adding
+// the value to `supplied_values` under the field's slug (or an empty string to
+// settle the field as intentionally empty), records the ask in
+// `visited_fingerprints`, and re-invokes with the same task space id. On the
+// resumed round the answer is a direct fill, keyed to the field's own name, no
+// Jev judgment on the way: the judgment was Claude Code's when it answered.
 //
-// Submitting is unreachable, not discouraged — and this cut goes one further:
-// the loop never clicks anything at all, so no commit-like control can be
-// clicked whatever its label. The commit filter (#2) still prunes upstream, and
-// the self-check asserts this file's own source contains no click.
+// The round trip runs entirely through job.json, whose path is absolute and
+// derived from HOME — nothing travels through the shell, so a goal string with
+// quotes, backticks, or newlines cannot break the invocation, and the
+// self-check asserts the source can reach no shell at all. ego-browser resumes
+// the task space, so page state survives between rounds.
+//
+// Submitting is unreachable, not discouraged — and this loop goes one further:
+// it never clicks anything at all, so no commit-like control can be clicked
+// whatever its label. The commit filter (#2) still prunes upstream, and the
+// self-check asserts this file's own source contains no click.
 //
 // Run:   cat scripts/prune.js scripts/fill-form.js | ego-browser nodejs
 // Check: node scripts/fill-form.js      (guards and the decider, no browser)
 //
-// One heredoc per round, one JSON object out. job.json carries the goal, the
-// start url, the task space id, `values` — the closed set as { id: value },
-// whose ids become the choice criteria — and optionally step_budget (default
-// 20) and filled_refs (fields settled by an earlier round). It is written by
-// the caller, never by this script. Nothing can be passed in from the caller,
-// so the root is derived from HOME, as in skeleton.js.
+// One heredoc per round, one JSON object out. job.json carries task_space_id,
+// goal, start_url, supplied_values (the closed set as { id: value }, whose ids
+// become the choice criteria), step_budget (default 20), settled_refs (fields
+// an earlier round filled or settled), visited_fingerprints (needs_input asks
+// already answered, as `<fingerprint>:<field>`), and escalated_fingerprints
+// (fingerprints this task has escalated on). It is written by the caller,
+// never by this script. Nothing can be passed in from the caller, so the root
+// is derived from HOME, as in skeleton.js.
 //
 // The browser work and the control flow are deliberately separated, as in
 // explore.js: everything that decides is a pure function, so every guard and
@@ -42,6 +56,11 @@ const MODEL = 'jev-1.13.0'
 // set. Everything else is left alone and reported.
 const FIELD_STATED_NOUL = 0.5 // < the field is left alone, whatever the choice says
 const FIELD_CONFIDENCE = 0.5 // < the pick is shaky, so it is left alone
+
+// The skip reasons a caller can answer with a value (#7). `invalid_response` is
+// the system failing, not a value missing, and a fill that threw is a broken
+// field, not a question — neither becomes a needs_input.
+const WANTS_VALUE = new Set(['not_stated', 'no_value', 'low_confidence'])
 
 // The platform allows 255 choice options; `none` takes one seat.
 const MAX_VALUES = 254
@@ -95,11 +114,11 @@ export function matchesStartUrl(observedUrl, startUrl) {
   return clean(observedUrl) === clean(startUrl)
 }
 
-// The guards. This cut has two: the step budget, and the start-page check the
-// caller of the loop performs on the first observation. The repeat-page and
-// ping-pong guards of explore.js are not here yet: a fill changes the page it
-// acts on by definition, so a fingerprint seen twice means something else and
-// the zero-fill exit below converges the loop first.
+// The guards. The step budget; the ping-pong guards (#7) ride on the lists the
+// caller maintains in job.json and fire where the exits are decided. The
+// repeat-page guard of explore.js has no seat here: a fill changes the page it
+// acts on by definition, and the open-field set shrinks monotonically, so the
+// loop converges before a page can repeat.
 export function preflight({ step, budget }) {
   if (step > budget) return { reason: 'step_budget' }
   return null
@@ -143,6 +162,93 @@ export function capValues(values) {
     .filter(([id, value]) => typeof id === 'string' && id.trim() && typeof value === 'string' && value.length > 0)
     .slice(0, MAX_VALUES)
   return entries.length > 0 ? Object.fromEntries(entries) : null
+}
+
+// The name a `needs_input` exit uses for a field (#7), and the key the caller
+// answers it under in `supplied_values`: the label, folded to an id. Two
+// same-labelled fields collapse onto one answer on purpose — same label, same
+// question.
+export function fieldSlug(label) {
+  const slug = String(label ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  return slug || 'field'
+}
+
+// What the exit asks for, assembled in code from the label Jev already read.
+// Jev cannot generate text (spec.md, Limits), so the ask is never written by
+// the model — the label is page content code copied, exactly like a finding's
+// evidence span.
+export function wantsFor(label) {
+  return `a value for the "${label}" field`
+}
+
+// The ping-pong key of a needs_input ask (#7): which field on which page. A
+// bare fingerprint cannot tell "the caller's answer did not unblock this
+// field" — a ping-pong — from "this page has a second unknown field" — the
+// next legitimate question. Keyed by both, so the first repeats and the second
+// proceeds.
+export function visitedKey(fingerprint, slug) {
+  return `${fingerprint}:${slug}`
+}
+
+// The direct channel (#7). A supplied value whose id is the field's own slug
+// is the caller answering a needs_input — or pre-supplying a known value — so
+// it is an answer, not a candidate: the judgment is Claude Code's, and code
+// fills it without an ask. An empty string is an explicit "nothing belongs
+// here": the field settles without a value, which is how an optional field the
+// goal does not need gets out of the loop instead of deadlocking it. Anything
+// else under that key — a number, an object — is a malformed answer, not an
+// answer, and leaves the field open for the guard to catch the re-ask.
+export function answeredFields(fields, suppliedValues) {
+  if (!suppliedValues || typeof suppliedValues !== 'object' || Array.isArray(suppliedValues)) return []
+  return fields
+    .map((field) => {
+      const slug = fieldSlug(field.label)
+      if (!Object.prototype.hasOwnProperty.call(suppliedValues, slug)) return null
+      const value = suppliedValues[slug]
+      if (typeof value !== 'string') return null
+      return { ...field, slug, value: value.length > 0 ? value : null }
+    })
+    .filter(Boolean)
+}
+
+// Settled by ref — this run's fills; refs belong to a snapshot, so this half
+// is best-effort across a re-render — or by slug, which is stable across
+// rounds. The loop records both when it fills; the caller settles an optional
+// field by its slug alone.
+export function isSettled(field, settled) {
+  return settled.has(field.ref) || settled.has(fieldSlug(field.label))
+}
+
+// The `needs_input` decision (#7), with its guard. The first field whose skip
+// is a missing value — companion Noul low, a `none` pick, or a shaky pick —
+// names the exit: the caller can answer exactly that, so asking is cheaper
+// than guessing. If this same ask was already answered once (the key is in
+// `visited_fingerprints`), asking again is a ping-pong, and the exit escalates
+// instead. A skip the system caused (`invalid_response`) is never a question
+// for the caller.
+export function needsInputFor(decisions, fingerprint, visited) {
+  const wanted = decisions.filter((decision) => decision.action === 'skip' && WANTS_VALUE.has(decision.reason))
+  if (wanted.length === 0) return null
+  const field = wanted[0]
+  const slug = fieldSlug(field.label)
+  const key = visitedKey(fingerprint, slug)
+  if (visited.has(key)) return { field: slug, key, pingPong: true }
+  return { field: slug, wants: wantsFor(field.label), key }
+}
+
+// The escalate half of the ping-pong guard (#7): a resumed round refuses to
+// escalate a second time on a fingerprint the caller already recorded in
+// `escalated_fingerprints` — it appends the exit's `page_fingerprint` when it
+// rewrites job.json, which the loop never writes. The repeat exits `ping_pong`
+// so a caller looping on the same page gets one terminal answer instead of the
+// same escalation forever; a caller that has genuinely changed the situation
+// clears the entry, because the file is its side of the contract.
+export function guardEscalate(reason, fingerprint, escalated) {
+  if (!reason || !fingerprint || !escalated.has(fingerprint)) return reason
+  return 'ping_pong'
 }
 
 // The questions. One choice per field over the closed set plus `none`, and one
@@ -369,9 +475,57 @@ function exitObject({ status, reason, detail, step, state, extra = {} }) {
     ...(reason ? { reason } : {}),
     ...(detail ? { detail } : {}),
     ...(state?.url ? { url: state.url } : {}),
+    // The caller records this when it rewrites job.json: into
+    // `escalated_fingerprints` on an escalate, into `visited_fingerprints` as
+    // `<fingerprint>:<field>` on a needs_input. That is what lets the next
+    // round refuse to repeat either one on the same page (#7).
     page_fingerprint: state?.fingerprint ?? null,
     ...extra,
   }
+}
+
+// The needs_input exit (#7), shared by every path that ends up needing a value
+// from the caller: a companion Noul that read low, a `none` pick, a shaky pick,
+// or no `supplied_values` at all. One field per round — the caller answers it
+// and re-invokes, so a many-field form converges over rounds — and every exit
+// carries `settled_refs` so the caller persists the round's progress when it
+// rewrites the job. Guarded: the same ask on the same page twice is a
+// ping-pong, and it escalates instead of asking forever. Callers of this
+// helper only reach it with at least one missing-value skip, so `ask` is
+// non-null by construction (the self-check pins that invariant).
+function needsInputExit(decisions, observed, context, visited) {
+  const ask = needsInputFor(decisions, observed.fingerprint, visited)
+  const unfilled = decisions.map(({ ref, label, reason }) => ({ ref, label, reason }))
+  if (ask.pingPong) {
+    return exitObject({
+      status: 'escalate',
+      reason: 'ping_pong',
+      step: context.steps,
+      state: observed,
+      extra: {
+        goal: context.goal,
+        filled: context.filled,
+        unfilled,
+        settled_refs: [...context.settled],
+        task_space_id: context.taskSpaceId,
+        detail: `${ask.field} was already asked for on this page and the answer did not unblock it`,
+      },
+    })
+  }
+  return exitObject({
+    status: 'needs_input',
+    step: context.steps,
+    state: observed,
+    extra: {
+      field: ask.field,
+      wants: ask.wants,
+      goal: context.goal,
+      filled: context.filled,
+      unfilled,
+      settled_refs: [...context.settled],
+      task_space_id: context.taskSpaceId,
+    },
+  })
 }
 
 async function main() {
@@ -384,25 +538,42 @@ async function main() {
   }
 
   const job = JSON.parse(fs.readFileSync(JOB_PATH, 'utf8'))
-  const values = capValues(job.values)
-  if (!values) {
+  // The supplied values, raw and capped. A missing `supplied_values` is round 1
+  // of a task whose values are not known yet — the needs_input flow exists for
+  // exactly that (#7) — but a malformed one is a caller bug, and it stops
+  // before the first ask. Empty-string entries never reach Jev (capValues
+  // drops them) and only ever act through the direct channel, where they
+  // settle a field as intentionally empty.
+  const raw = job.supplied_values
+  if (raw != null && (typeof raw !== 'object' || Array.isArray(raw))) {
     return exitObject({
       status: 'escalate',
       reason: 'no_values',
       extra: {
         goal: job.goal,
-        detail: 'job.values must be a non-empty object of { id: value } strings',
+        detail: 'job.supplied_values must be an object of { id: value } strings',
       },
     })
   }
-  const valueIds = Object.keys(values)
+  const supplied = raw ?? {}
+  const values = capValues(supplied)
+  const valueIds = values ? Object.keys(values) : []
   const key = await readKey()
   const budget = job.step_budget ?? STEP_BUDGET
 
-  // Fields settled by an earlier round — filled, or found broken — so a resumed
-  // run neither refills nor re-hammers them. The caller persists these from the
-  // exit object when it rewrites job.json.
-  const settledRefs = new Set(job.filled_refs ?? [])
+  // Cross-round guard state, carried in job.json and written only by the
+  // caller (#7): `visited_fingerprints` holds the `<fingerprint>:<field>` keys
+  // of needs_input asks already answered once, `escalated_fingerprints` the
+  // fingerprints this task has escalated on. The resumed round reads both, so
+  // the ping-pong guard works across the resume boundary, not just within one.
+  const visited = new Set(job.visited_fingerprints ?? [])
+  const escalated = new Set(job.escalated_fingerprints ?? [])
+
+  // Fields settled by an earlier round — filled by the loop (recorded by ref
+  // and by slug), or settled without a value by the caller under the field's
+  // slug — so a resumed run neither refills nor re-asks them. The caller
+  // persists these from the exit object when it rewrites job.json.
+  const settled = new Set(job.settled_refs ?? [])
   const filled = []
   const unfilled = []
 
@@ -435,19 +606,27 @@ async function main() {
 
     const stop = preflight({ step: steps, budget })
     if (stop) {
+      const reason = guardEscalate(stop.reason, observed.fingerprint, escalated)
       return exitObject({
         status: 'escalate',
-        reason: stop.reason,
+        reason,
         step: steps,
         state: observed,
-        extra: { goal: job.goal, filled, unfilled },
+        extra: {
+          goal: job.goal,
+          filled,
+          unfilled,
+          settled_refs: [...settled],
+          task_space_id: task.id,
+          ...(reason === 'ping_pong' ? { detail: `${stop.reason} escalated on this page once before` } : {}),
+        },
       })
     }
 
-    // Ask only about what is still open. Fields dropped since last round are
-    // the ones code settled; the loop converges when none remain.
-    const fields = observed.fields.filter((field) => !settledRefs.has(field.ref))
-    if (fields.length === 0) {
+    // Ask and fill only what is still open. Fields dropped since last round
+    // are the ones code settled; the loop converges when none remain.
+    const open = observed.fields.filter((field) => !isSettled(field, settled))
+    if (open.length === 0) {
       return exitObject({
         status: 'done',
         step: steps,
@@ -456,13 +635,68 @@ async function main() {
           goal: job.goal,
           filled,
           unfilled,
-          filled_refs: [...settledRefs],
+          settled_refs: [...settled],
           task_space_id: task.id,
         },
       })
     }
 
-    const questions = buildQuestions(fields, valueIds)
+    // The direct channel (#7): answers the caller keyed to the field's own
+    // slug. Code fills them before any ask, because the judgment was Claude
+    // Code's when it answered the needs_input — asking Jev to re-approve it
+    // would hand the caller's answer back to the companion Noul that read low
+    // and ping-pong forever. The fills happen straight off this step's
+    // observation with no await in between, so the refs are the ones the
+    // snapshot just read; the freshness re-observe below stays reserved for
+    // decisions that crossed an API round trip.
+    const answered = answeredFields(open, supplied)
+    if (answered.length > 0) {
+      for (const answer of answered) {
+        // An explicitly empty answer settles the field as intentionally empty:
+        // the caller was asked, and the answer was "nothing belongs here".
+        if (answer.value === null) {
+          settled.add(answer.slug)
+          unfilled.push({ ref: answer.ref, label: answer.label, reason: 'settled_empty' })
+          continue
+        }
+        try {
+          await fillInput(answer.ref, answer.value)
+          filled.push({ step: steps, ref: answer.ref, label: answer.label, value: answer.value, via: 'supplied' })
+          settled.add(answer.ref)
+          settled.add(answer.slug)
+        } catch (error) {
+          // Settled as broken, exactly like a failed Jev-driven fill: do not
+          // hammer a field that refused its value.
+          unfilled.push({
+            ref: answer.ref,
+            label: answer.label,
+            reason: 'fill_failed',
+            detail: String(error && error.message ? error.message : error),
+          })
+          settled.add(answer.ref)
+          settled.add(answer.slug)
+        }
+      }
+      // Hydrated forms react to fills (conditional fields, validations); let
+      // them settle before the next observation reads the result, exactly as
+      // after a Jev-driven fill.
+      await wait(SETTLE_SECONDS)
+      continue
+    }
+
+    // No values to offer, no question to ask (#7): every open field is a value
+    // only the caller can name. Same exit a low companion Noul would produce,
+    // under the same guard.
+    if (valueIds.length === 0) {
+      return needsInputExit(
+        open.map((field) => ({ ...field, action: 'skip', reason: 'no_value' })),
+        observed,
+        { steps, goal: job.goal, filled, unfilled, settled, taskSpaceId: task.id },
+        visited,
+      )
+    }
+
+    const questions = buildQuestions(open, valueIds)
     const state = fitState({
       goal: job.goal,
       current_page: observed.pageText.slice(0, MAX_PAGE_CHARS),
@@ -472,10 +706,10 @@ async function main() {
     const response = await ask({ model: MODEL, state, questions }, key)
     tally(response)
 
-    const decisions = decideFields(response, fields, valueIds)
+    const decisions = decideFields(response, open, valueIds)
     const fillDecisions = decisions.filter((decision) => decision.action === 'fill')
 
-    const escalateReason = escalationReason(decisions)
+    const escalateReason = guardEscalate(escalationReason(decisions), observed.fingerprint, escalated)
     if (escalateReason) {
       return exitObject({
         status: 'escalate',
@@ -486,33 +720,28 @@ async function main() {
           goal: job.goal,
           filled,
           unfilled,
-          detail: 'every field came back malformed; nothing was filled',
+          settled_refs: [...settled],
+          task_space_id: task.id,
+          detail: escalateReason === 'ping_pong'
+            ? 'invalid_response escalated on this page once before'
+            : 'every field came back malformed; nothing was filled',
         },
       })
     }
 
-    // Nothing decided this step is convergence, not failure: Jev is stateless,
-    // so a second ask over the same page and the same goal returns the same
-    // skips. Report what was filled and what was left alone, and stop before
-    // any submit. A multi-step form that reveals new fields after a fill is the
-    // reason this is checked per step and not up front — a fill is exactly what
-    // happened before this branch can be reached.
+    // Nothing decided this step is not failure but a question (#7): the skips
+    // name the values the caller has to supply, one per round, instead of a
+    // silent `done` over fields the form still needs. A multi-step form that
+    // reveals new fields after a fill is the reason this is checked per step
+    // and not up front — a fill is exactly what happened before this branch
+    // can be reached.
     if (fillDecisions.length === 0) {
-      for (const decision of decisions) {
-        unfilled.push({ ref: decision.ref, label: decision.label, reason: decision.reason })
-      }
-      return exitObject({
-        status: 'done',
-        step: steps,
-        state: observed,
-        extra: {
-          goal: job.goal,
-          filled,
-          unfilled,
-          filled_refs: [...settledRefs],
-          task_space_id: task.id,
-        },
-      })
+      return needsInputExit(
+        decisions,
+        observed,
+        { steps, goal: job.goal, filled, unfilled, settled, taskSpaceId: task.id },
+        visited,
+      )
     }
 
     // Act on fresh eyes only (spec.md "Freshness"): the page is re-observed and
@@ -524,12 +753,20 @@ async function main() {
     if (fresh.fingerprint !== observed.fingerprint) {
       stale += 1
       if (stale > STALE_LIMIT) {
+        const reason = guardEscalate('stale_page', fresh.fingerprint, escalated)
         return exitObject({
           status: 'escalate',
-          reason: 'stale_page',
+          reason,
           step: steps,
           state: fresh,
-          extra: { goal: job.goal, filled, unfilled },
+          extra: {
+            goal: job.goal,
+            filled,
+            unfilled,
+            settled_refs: [...settled],
+            task_space_id: task.id,
+            ...(reason === 'ping_pong' ? { detail: 'stale_page escalated on this page once before' } : {}),
+          },
         })
       }
       continue
@@ -547,7 +784,8 @@ async function main() {
           label: decision.label,
           value_id: decision.value_id,
         })
-        settledRefs.add(decision.ref)
+        settled.add(decision.ref)
+        settled.add(fieldSlug(decision.label))
       } catch (error) {
         // A field that cannot take its value is settled as broken, not retried:
         // hammering a readonly input for the rest of the budget helps nobody.
@@ -557,7 +795,8 @@ async function main() {
           reason: 'fill_failed',
           detail: String(error && error.message ? error.message : error),
         })
-        settledRefs.add(decision.ref)
+        settled.add(decision.ref)
+        settled.add(fieldSlug(decision.label))
       }
     }
     // Hydrated forms react to fills (conditional fields, validations); let them
@@ -591,6 +830,14 @@ async function runSelfCheck() {
   const source = fs.readFileSync(new URL(import.meta.url), 'utf8')
   assert.ok(!/(?<![A-Za-z])click\(/.test(source), 'the fill loop contains a click')
   assert.equal(detail.commitCount, 4, 'the commit filter still fired upstream')
+
+  // The shell guarantee (#7): nothing travels through a shell, so a goal with
+  // quotes, backticks, or newlines cannot break the invocation. The only way
+  // this runtime can reach a shell is node's child process module; the module
+  // name below is assembled from pieces so the check does not find itself.
+  // (The exit object still goes out through cliLog, which writes stderr — a
+  // caller capturing stdout reads nothing, per spec.md platform facts.)
+  assert.ok(!source.includes('child_' + 'process'), 'the loop can reach no shell: goal and answer travel in job.json only')
 
   // The closed set. The choice criteria are exactly the supplied value ids plus
   // `none` — never free text, never a value Jev could echo back as an answer.
@@ -706,6 +953,121 @@ async function runSelfCheck() {
   )
   assert.equal(escalationReason([]), null, 'no fields, no escalation')
 
+  // ---- the needs_input round trip (#7) ----
+
+  // The name the exit uses, and the key the caller answers under: the label
+  // folded to a slug, stable across rounds even when refs renumber.
+  assert.equal(fieldSlug('VAT number'), 'vat_number', 'a label folds to an id')
+  assert.equal(fieldSlug('  Company (No.)  '), 'company_no', 'punctuation collapses to one separator')
+  assert.equal(fieldSlug(''), 'field', 'an empty label still names something')
+  assert.equal(wantsFor('VAT number'), 'a value for the "VAT number" field', 'the ask is assembled, not generated')
+  assert.equal(visitedKey('a1b2c3', 'vat_number'), 'a1b2c3:vat_number', 'a ping-pong key names the field on the page')
+
+  // The direct channel: a value keyed to the field's own slug is the caller's
+  // answer, filled without an ask; an empty string settles the field as
+  // intentionally empty; anything else is not an answer.
+  assert.deepEqual(
+    answeredFields(fields, { vat_number: 'GB 123 4567 89', other_id: 'x' }),
+    [{ ref: '@20', label: 'VAT number', slug: 'vat_number', value: 'GB 123 4567 89' }],
+    'a value keyed to the slug is a direct answer',
+  )
+  assert.deepEqual(
+    answeredFields(fields, { vat_number: '' }),
+    [{ ref: '@20', label: 'VAT number', slug: 'vat_number', value: null }],
+    'an empty string settles the field without a value',
+  )
+  assert.deepEqual(answeredFields(fields, { other_id: 'x' }), [], 'an unrelated id is not an answer')
+  assert.deepEqual(answeredFields(fields, { vat_number: 42 }), [], 'a non-string answer is not an answer')
+  assert.deepEqual(answeredFields(fields, null), [], 'no supplied values, no answers')
+
+  // Settling, by ref for this run's fills and by slug for anything that must
+  // survive a re-render or a round boundary.
+  assert.equal(isSettled({ ref: '@20', label: 'VAT number' }, new Set(['@20'])), true, 'settled by ref')
+  assert.equal(isSettled({ ref: '@20', label: 'VAT number' }, new Set(['vat_number'])), true, 'settled by slug')
+  assert.equal(isSettled({ ref: '@20', label: 'VAT number' }, new Set()), false, 'unsettled')
+
+  // The needs_input decision: the first missing-value skip names the exit; a
+  // malformed skip is the system failing and never becomes a question; a fill
+  // asks for nothing.
+  const skipDecisions = [
+    { ref: '@20', label: 'VAT number', action: 'skip', reason: 'not_stated' },
+    { ref: '@31', label: 'Company number', action: 'skip', reason: 'invalid_response' },
+  ]
+  assert.deepEqual(
+    needsInputFor(skipDecisions, 'fp1', new Set()),
+    { field: 'vat_number', wants: 'a value for the "VAT number" field', key: 'fp1:vat_number' },
+    'the first answerable field names the exit',
+  )
+  const repeated = needsInputFor(skipDecisions, 'fp1', new Set(['fp1:vat_number']))
+  assert.equal(repeated.pingPong, true, 'the same ask twice is a ping-pong')
+  assert.equal(repeated.field, 'vat_number', 'the ping-pong still says which field stalled')
+  assert.equal(
+    needsInputFor([{ ref: '@1', label: 'X', action: 'skip', reason: 'invalid_response' }], 'fp', new Set()),
+    null,
+    'a malformed answer is not a question for the caller',
+  )
+  assert.equal(needsInputFor([{ ref: '@1', label: 'X', action: 'fill' }], 'fp', new Set()), null, 'a fill asks for nothing')
+  // A second unknown field on the same page is a new key, so it still asks:
+  // the flat fingerprint could not tell this from the ping-pong above.
+  assert.equal(
+    needsInputFor(
+      [{ ref: '@40', label: 'Company number', action: 'skip', reason: 'no_value' }],
+      'fp1',
+      new Set(['fp1:vat_number']),
+    ).field,
+    'company_number',
+    'a different field on the same page is the next question, not a ping-pong',
+  )
+
+  // The escalate half of the guard: a fingerprint already recorded escalates
+  // `ping_pong` instead of the same escalation forever; a first one keeps its
+  // reason; nothing escalates, nothing guards.
+  assert.equal(guardEscalate('stale_page', 'fp9', new Set()), 'stale_page', 'a first escalation keeps its reason')
+  assert.equal(guardEscalate('stale_page', 'fp9', new Set(['fp9'])), 'ping_pong', 'a repeat escalation converges')
+  assert.equal(guardEscalate(null, 'fp9', new Set(['fp9'])), null, 'no escalation, no guard')
+  assert.equal(guardEscalate('stale_page', null, new Set(['fp9'])), 'stale_page', 'no fingerprint, no guard')
+
+  // needs_input and escalate stay distinct, in the exit objects themselves:
+  // needs_input names a field the caller can answer and carries no reason;
+  // escalate carries a reason from the closed vocabulary and no field.
+  const needsExit = needsInputExit(
+    skipDecisions,
+    { fingerprint: 'fp1', url: 'https://x.io/form' },
+    { steps: 2, goal: 'g', filled: [], unfilled: [], settled: [], taskSpaceId: 3 },
+    new Set(),
+  )
+  assert.equal(needsExit.status, 'needs_input', 'a missing value is needs_input')
+  assert.equal(needsExit.field, 'vat_number', 'it names the field')
+  assert.equal(needsExit.wants, 'a value for the "VAT number" field', 'it says what it wants')
+  assert.equal(needsExit.page_fingerprint, 'fp1', 'it carries the fingerprint the caller records')
+  assert.equal(needsExit.task_space_id, 3, 'it carries the task space id the caller re-invokes')
+  assert.equal(needsExit.reason, undefined, 'and it is not an escalate')
+  const pongExit = needsInputExit(
+    skipDecisions,
+    { fingerprint: 'fp1', url: 'https://x.io/form' },
+    { steps: 2, goal: 'g', filled: [], unfilled: [], settled: [], taskSpaceId: 3 },
+    new Set(['fp1:vat_number']),
+  )
+  assert.equal(pongExit.status, 'escalate', 'the repeat is an escalate')
+  assert.equal(pongExit.reason, 'ping_pong', 'specifically a ping-pong')
+  assert.equal(pongExit.field, undefined, 'and it does not ask again')
+
+  // Criterion 4: a goal string with quotes, backticks, and newlines round-trips
+  // unharmed — it lives in job.json, travels in a JSON body, and comes back in
+  // the exit object, never once passing through a shell.
+  const hostile = 'fill "the VAT" field, `then` say hi;\nnewlines\n$(rm -rf /) ${HOME} `echo pwned`'
+  const hostileState = fitState({ goal: hostile, current_page: 'p'.repeat(40), supplied_values: values }, questions)
+  const roundTripped = JSON.parse(JSON.stringify({
+    status: 'needs_input',
+    field: 'vat_number',
+    wants: wantsFor('VAT number'),
+    goal: hostileState.goal,
+    page_fingerprint: 'fp1',
+  }))
+  assert.equal(roundTripped.goal, hostile, 'the goal survives quotes, backticks, and newlines')
+  assert.ok(roundTripped.goal.includes('`then`') && roundTripped.goal.includes('\n'), 'every hostile character intact')
+  assert.equal(roundTripped.wants, 'a value for the "VAT number" field', 'the ask rides out next to it')
+
   // Guards: the budget is 20 by default and a step past it stops.
   assert.equal(STEP_BUDGET, 20)
   assert.equal(preflight({ step: 20, budget: 20 }), null, 'the twentieth step runs')
@@ -731,7 +1093,7 @@ async function runSelfCheck() {
 // there is electron's own path, not ours.
 if (process.argv[1] && process.argv[1].endsWith('fill-form.js')) {
   const fieldCount = await runSelfCheck()
-  console.log(`fill-form.js self-check ok (guards and the per-field decider checked, ${fieldCount} fillable field in the fixture)`)
+  console.log(`fill-form.js self-check ok (guards, the per-field decider, and the needs_input round trip checked, ${fieldCount} fillable field in the fixture)`)
 } else {
   let result
   try {
