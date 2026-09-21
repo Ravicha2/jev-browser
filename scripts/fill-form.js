@@ -29,7 +29,7 @@
 // whatever its label. The commit filter (#2) still prunes upstream, and the
 // self-check asserts this file's own source contains no click.
 //
-// Run:   cat scripts/prune.js scripts/fill-form.js | ego-browser nodejs
+// Run:   cat scripts/prune.js scripts/ledger.js scripts/fill-form.js | ego-browser nodejs
 // Check: node scripts/fill-form.js      (guards and the decider, no browser)
 //
 // One heredoc per round, one JSON object out. job.json carries task_space_id,
@@ -102,6 +102,7 @@ const ROOT = ROOTS.find((candidate) => fs.existsSync(`${candidate}/.env`)) || nu
 // time. Not TMPDIR, which the OS reaps, or a login handoff cannot resume after
 // an overnight wait. See spec.md Configuration.
 const JOB_PATH = `${HOME}/.claude/jev-browser/job.json`
+const RUNS_ROOT = `${HOME}/.claude/jev-browser/runs`
 
 // ---------------------------------------------------------------- pure control
 
@@ -458,6 +459,11 @@ async function observe() {
 const usageTotal = { requests: 0 }
 let modelSeen = null
 
+// The run directory of the live round (#9), set once main has resolved it. The
+// run directory is the task's, not the explore loop's: a form round resumed
+// after a needs_input addresses the same directory the collection ran in.
+let ACTIVE_RUN = null
+
 function tally(response) {
   usageTotal.requests += 1
   modelSeen = response.model ?? modelSeen
@@ -480,6 +486,11 @@ function exitObject({ status, reason, detail, step, state, extra = {} }) {
     // `<fingerprint>:<field>` on a needs_input. That is what lets the next
     // round refuse to repeat either one on the same page (#7).
     page_fingerprint: state?.fingerprint ?? null,
+    // The run artifacts (#9): `run_dir` goes back into job.json, and round N+1
+    // appends to the same trace (and the same ledger, when a collection ran in
+    // this task). A round that exited before the directory existed collected
+    // nothing, so it names none.
+    ...(ACTIVE_RUN ? { run_dir: ACTIVE_RUN.dir, ledger: ACTIVE_RUN.ledger, trace: ACTIVE_RUN.trace } : {}),
     ...extra,
   }
 }
@@ -496,6 +507,9 @@ function exitObject({ status, reason, detail, step, state, extra = {} }) {
 function needsInputExit(decisions, observed, context, visited) {
   const ask = needsInputFor(decisions, observed.fingerprint, visited)
   const unfilled = decisions.map(({ ref, label, reason }) => ({ ref, label, reason }))
+  // Whatever a collection in this task already gathered rides out on every
+  // exit (#9), so a form round cannot orphan it.
+  const partial = { partial_findings: context.partialFindings ?? [] }
   if (ask.pingPong) {
     return exitObject({
       status: 'escalate',
@@ -506,6 +520,7 @@ function needsInputExit(decisions, observed, context, visited) {
         goal: context.goal,
         filled: context.filled,
         unfilled,
+        ...partial,
         settled_refs: [...context.settled],
         task_space_id: context.taskSpaceId,
         detail: `${ask.field} was already asked for on this page and the answer did not unblock it`,
@@ -522,6 +537,7 @@ function needsInputExit(decisions, observed, context, visited) {
       goal: context.goal,
       filled: context.filled,
       unfilled,
+      ...partial,
       settled_refs: [...context.settled],
       task_space_id: context.taskSpaceId,
     },
@@ -561,6 +577,19 @@ async function main() {
   const key = await readKey()
   const budget = job.step_budget ?? STEP_BUDGET
 
+  // The run directory (#9), shared with the task's other rounds: reused when
+  // the caller recorded `run_dir` from the last exit — that is the round trip
+  // of a needs_input — created fresh on round 1. The ledger is read once and
+  // rides out on every exit, so a collection that ran earlier in this task is
+  // never orphaned by the form rounds.
+  const run = resolveRunDir(job, {
+    runsRoot: RUNS_ROOT,
+    exists: (path) => fs.existsSync(path),
+    mkdirp: (path) => fs.mkdirSync(path, { recursive: true }),
+  })
+  ACTIVE_RUN = run
+  const partialFindings = readFindings(run.ledger)
+
   // Cross-round guard state, carried in job.json and written only by the
   // caller (#7): `visited_fingerprints` holds the `<fingerprint>:<field>` keys
   // of needs_input asks already answered once, `escalated_fingerprints` the
@@ -599,15 +628,49 @@ async function main() {
 
   let steps = 0
   let stale = 0
+  // Per-step trace state (#9): one line per step, written when the step's
+  // outcome is known. The form loop scrolls never, so `page_changed` is the
+  // fingerprint alone (epsilon 0).
+  let prevTracePoint = null
 
   while (true) {
     steps += 1
     const observed = await observe()
 
+    const traceStep = ({ decision, latencyMs = null, usage = null, fields = null }) => {
+      if (!ACTIVE_RUN) return
+      appendTrace(ACTIVE_RUN.trace, {
+        step: steps,
+        url: observed.url,
+        fingerprint: observed.fingerprint,
+        sy: observed.sy,
+        page_changed: pageChanged(prevTracePoint, observed, 0),
+        decision,
+        ...(fields ? { fields } : {}),
+        latency_ms: latencyMs,
+        usage,
+        model: modelSeen,
+      })
+      prevTracePoint = { fingerprint: observed.fingerprint, sy: observed.sy }
+    }
+    // An exit is the step's outcome too: the trace names it before the object
+    // goes out, so the file reads as the round's whole story.
+    const emit = (exit, { latencyMs = null, usage = null, fields = null } = {}) => {
+      traceStep({
+        decision: exit.status === 'done'
+          ? 'done'
+          : `${exit.status}:${exit.reason ?? exit.field ?? ''}`,
+        latencyMs,
+        usage,
+        fields,
+      })
+      return exit
+    }
+
     const stop = preflight({ step: steps, budget })
     if (stop) {
       const reason = guardEscalate(stop.reason, observed.fingerprint, escalated)
-      return exitObject({
+      return emit(exitObject({
         status: 'escalate',
         reason,
         step: steps,
@@ -616,18 +679,19 @@ async function main() {
           goal: job.goal,
           filled,
           unfilled,
+          partial_findings: partialFindings,
           settled_refs: [...settled],
           task_space_id: task.id,
           ...(reason === 'ping_pong' ? { detail: `${stop.reason} escalated on this page once before` } : {}),
         },
-      })
+      }))
     }
 
     // Ask and fill only what is still open. Fields dropped since last round
     // are the ones code settled; the loop converges when none remain.
     const open = observed.fields.filter((field) => !isSettled(field, settled))
     if (open.length === 0) {
-      return exitObject({
+      return emit(exitObject({
         status: 'done',
         step: steps,
         state: observed,
@@ -635,10 +699,11 @@ async function main() {
           goal: job.goal,
           filled,
           unfilled,
+          partial_findings: partialFindings,
           settled_refs: [...settled],
           task_space_id: task.id,
         },
-      })
+      }))
     }
 
     // The direct channel (#7): answers the caller keyed to the field's own
@@ -680,6 +745,7 @@ async function main() {
       // Hydrated forms react to fills (conditional fields, validations); let
       // them settle before the next observation reads the result, exactly as
       // after a Jev-driven fill.
+      traceStep({ decision: `direct_fill:${answered.map((answer) => answer.slug).join('+')}` })
       await wait(SETTLE_SECONDS)
       continue
     }
@@ -688,12 +754,12 @@ async function main() {
     // only the caller can name. Same exit a low companion Noul would produce,
     // under the same guard.
     if (valueIds.length === 0) {
-      return needsInputExit(
+      return emit(needsInputExit(
         open.map((field) => ({ ...field, action: 'skip', reason: 'no_value' })),
         observed,
-        { steps, goal: job.goal, filled, unfilled, settled, taskSpaceId: task.id },
+        { steps, goal: job.goal, filled, unfilled, settled, taskSpaceId: task.id, partialFindings },
         visited,
-      )
+      ))
     }
 
     const questions = buildQuestions(open, valueIds)
@@ -703,15 +769,20 @@ async function main() {
       supplied_values: values,
     }, questions)
 
+    const startedAt = Date.now()
     const response = await ask({ model: MODEL, state, questions }, key)
+    const latencyMs = Date.now() - startedAt
     tally(response)
 
     const decisions = decideFields(response, open, valueIds)
     const fillDecisions = decisions.filter((decision) => decision.action === 'fill')
+    const fieldsTrace = decisions.map(({ ref, action, reason, value_id: valueId }) => (
+      action === 'fill' ? { ref, action, value_id: valueId } : { ref, action, reason }
+    ))
 
     const escalateReason = guardEscalate(escalationReason(decisions), observed.fingerprint, escalated)
     if (escalateReason) {
-      return exitObject({
+      return emit(exitObject({
         status: 'escalate',
         reason: escalateReason,
         step: steps,
@@ -720,13 +791,14 @@ async function main() {
           goal: job.goal,
           filled,
           unfilled,
+          partial_findings: partialFindings,
           settled_refs: [...settled],
           task_space_id: task.id,
           detail: escalateReason === 'ping_pong'
             ? 'invalid_response escalated on this page once before'
             : 'every field came back malformed; nothing was filled',
         },
-      })
+      }), { latencyMs, usage: response.usage ?? null, fields: fieldsTrace })
     }
 
     // Nothing decided this step is not failure but a question (#7): the skips
@@ -736,12 +808,12 @@ async function main() {
     // and not up front — a fill is exactly what happened before this branch
     // can be reached.
     if (fillDecisions.length === 0) {
-      return needsInputExit(
+      return emit(needsInputExit(
         decisions,
         observed,
-        { steps, goal: job.goal, filled, unfilled, settled, taskSpaceId: task.id },
+        { steps, goal: job.goal, filled, unfilled, settled, taskSpaceId: task.id, partialFindings },
         visited,
-      )
+      ), { latencyMs, usage: response.usage ?? null, fields: fieldsTrace })
     }
 
     // Act on fresh eyes only (spec.md "Freshness"): the page is re-observed and
@@ -754,7 +826,7 @@ async function main() {
       stale += 1
       if (stale > STALE_LIMIT) {
         const reason = guardEscalate('stale_page', fresh.fingerprint, escalated)
-        return exitObject({
+        return emit(exitObject({
           status: 'escalate',
           reason,
           step: steps,
@@ -763,12 +835,14 @@ async function main() {
             goal: job.goal,
             filled,
             unfilled,
+            partial_findings: partialFindings,
             settled_refs: [...settled],
             task_space_id: task.id,
             ...(reason === 'ping_pong' ? { detail: 'stale_page escalated on this page once before' } : {}),
           },
-        })
+        }), { latencyMs, usage: response.usage ?? null, fields: fieldsTrace })
       }
+      traceStep({ decision: 'stale', latencyMs, usage: response.usage ?? null, fields: fieldsTrace })
       continue
     }
     stale = 0
@@ -801,6 +875,7 @@ async function main() {
     }
     // Hydrated forms react to fills (conditional fields, validations); let them
     // settle before the next observation reads the result.
+    traceStep({ decision: `fill:${fillDecisions.map((decision) => decision.ref).join('+')}`, latencyMs, usage: response.usage ?? null, fields: fieldsTrace })
     await wait(SETTLE_SECONDS)
   }
 }
@@ -1086,6 +1161,55 @@ async function runSelfCheck() {
   assert.equal(roles.get('21'), 'button', 'the submit control reads as a button')
   assert.equal(fillableFields(detail.candidates, roles).length, 1)
 
+  // ---- the run directory across the needs_input round trip (#9) ----
+  // The ledger is the explore loop's payload, but the run directory is the
+  // task's: round N+1 after a needs_input reuses the directory the caller
+  // recorded from the last exit, so a collection that ran earlier in this task
+  // keeps its ledger and its trace.
+
+  const ledger = await import(new URL('./ledger.js', import.meta.url).href)
+  const runsRoot = '/tmp/runs-root'
+  let madeCalls = 0
+  const freshDir = ledger.resolveRunDir({ goal: 'fill the VAT field' }, {
+    runsRoot,
+    exists: () => false,
+    mkdirp: () => { madeCalls += 1 },
+  })
+  assert.equal(freshDir.reused, false, 'round 1 creates its run directory')
+  assert.equal(madeCalls, 1, 'exactly one directory made')
+  const resumed = ledger.resolveRunDir(
+    { goal: 'fill the VAT field', run_dir: freshDir.dir },
+    { runsRoot, exists: () => true, mkdirp: () => { madeCalls += 1 } },
+  )
+  assert.equal(resumed.dir, freshDir.dir, 'round N+1 after a needs_input addresses the same run directory')
+  assert.equal(resumed.ledger, freshDir.ledger, 'so its ledger is the same ledger')
+  assert.equal(resumed.trace, freshDir.trace, 'and its trace is the same trace')
+  assert.equal(madeCalls, 1, 'reusing makes no directory')
+  // A claimed run_dir outside the runs root is a caller bug, not a destination:
+  // a fresh directory is made and nothing is redirected.
+  const foreign = ledger.resolveRunDir(
+    { goal: 'fill the VAT field', run_dir: '/tmp/elsewhere/run' },
+    { runsRoot, exists: () => true, mkdirp: () => { madeCalls += 1 } },
+  )
+  assert.equal(foreign.reused, false, 'a foreign run_dir is refused')
+  assert.ok(foreign.dir.startsWith(`${runsRoot}/`), 'and a fresh directory is made under the runs root')
+
+  // needs_input and escalate both carry what the ledger already holds, so a
+  // partially completed collection is not discarded across the round trip.
+  const withFindings = needsInputExit(
+    skipDecisions,
+    { fingerprint: 'fp1', url: 'https://x.io/form' },
+    { steps: 2, goal: 'g', filled: [], unfilled: [], settled: [], taskSpaceId: 3, partialFindings: [{ id: 'f1', value: 'v' }] },
+    new Set(),
+  )
+  assert.deepEqual(withFindings.partial_findings, [{ id: 'f1', value: 'v' }], 'partial findings ride on a needs_input')
+  assert.deepEqual(needsInputExit(
+    skipDecisions,
+    { fingerprint: 'fp1', url: 'https://x.io/form' },
+    { steps: 2, goal: 'g', filled: [], unfilled: [], settled: [], taskSpaceId: 3 },
+    new Set(),
+  ).partial_findings, [], 'an empty ledger rides as an empty list')
+
   return fields.length
 }
 
@@ -1099,11 +1223,15 @@ if (process.argv[1] && process.argv[1].endsWith('fill-form.js')) {
   try {
     result = await main()
   } catch (error) {
-    // One JSON object out, always, even on failure. The message never carries the key.
+    // One JSON object out, always, even on failure. The message never carries
+    // the key, and whatever a collection in this task gathered rides out (#9).
     result = exitObject({
       status: 'escalate',
       reason: 'error',
-      extra: { detail: String(error && error.message ? error.message : error) },
+      extra: {
+        detail: String(error && error.message ? error.message : error),
+        ...(ACTIVE_RUN ? { partial_findings: readFindings(ACTIVE_RUN.ledger) } : {}),
+      },
     })
   }
   cliLog(JSON.stringify(result))

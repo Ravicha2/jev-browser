@@ -40,6 +40,7 @@ if (!startUrl || goals.length === 0 || goals.some((entry) => !entry.goal)) {
 
 const loopSource = [
   readFileSync(`${HERE}/prune.js`, 'utf8'),
+  readFileSync(`${HERE}/ledger.js`, 'utf8'),
   readFileSync(`${HERE}/explore.js`, 'utf8'),
 ].join('\n')
 

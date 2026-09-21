@@ -1,0 +1,23 @@
+root
+  heading
+    text "Acme Retail Demo Store"
+  text "Search results for desk lamp"
+  list
+    listitem
+      anchor "Result 1" [ref=101, loc=href:/p/1, url=https://shop.example.com/p/1]
+        text "LED Desk Lamp, adjustable arm, three colour temperatures"
+        text "Price: $12.00"
+    listitem
+      anchor "Result 2" [ref=102, loc=href:/p/2, url=https://shop.example.com/p/2]
+        text "USB-C desk lamp with wireless charging base"
+        text "Price: $29.50"
+    listitem
+      anchor "Result 3" [ref=103, loc=href:/p/3, url=https://shop.example.com/p/3]
+        text "Clip-on reading light, USB powered"
+        text "Price: $8.25"
+  anchor "Read more" [ref=110, loc=href:/p/1, url=https://shop.example.com/p/1]
+    text "Read more"
+  anchor "Read more" [ref=111, loc=href:/p/2, url=https://shop.example.com/p/2]
+    text "Read more"
+  text "Seasonal note: prices shown include all applicable taxes and may vary by region, by warehouse, by promotions currently running, by membership status, and by whether the item ships from our regional storefront or direct from the supplier's own distribution partner network."
+  button "Buy now" [ref=120, loc=unstable]

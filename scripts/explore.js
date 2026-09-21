@@ -1,13 +1,24 @@
 // jev-browser explore loop (issue #3, reachability fixed in #10; spec.md "The
-// step loop").
+// step loop". Ledger, digest, and trace are #9).
 //
 // Exploratory collection. Snapshot, prune, ask Jev which candidate leads toward
 // the goal, branch in code, click what it named, repeat to the step budget. Jev
 // never ranks DOM refs for their own sake; it picks which *content* matters, and
 // code turns that pick into a click.
 //
-// Run:   cat scripts/prune.js scripts/explore.js | ego-browser nodejs
-// Check: node scripts/explore.js      (guards and the decider, no browser)
+// #9 makes the loop gather something. When `goal_met` fires, or a page reads as
+// one the goal asks us to read, a second ask pairs a selection Choice over
+// spans code copied from the visible snapshot with a `has_answer` Noul; code
+// copies the chosen span into the ledger. `goal_met` is a probability, not a
+// value, so it can never produce a finding by itself, and nothing generated can
+// reach the ledger: the Choice only names spans we offered. The ledger is the
+// payload (`runs/<timestamp>-<slug>/ledger.jsonl`), the digest is its bounded
+// projection into `state` so a multi-item goal neither fires early nor
+// re-collects, and `trace.jsonl` is the per-step record — decision,
+// probabilities, `page_changed`, url, token usage, latency — never sent to Jev.
+//
+// Run:   cat scripts/prune.js scripts/ledger.js scripts/explore.js | ego-browser nodejs
+// Check: node scripts/explore.js      (guards, the decider, the artifacts; no browser)
 //
 // One heredoc per round, one JSON object out. job.json carries the goal, the
 // start url, the task space id, and the fingerprints the guards need across
@@ -57,6 +68,13 @@ const MAX_REQUEST_CHARS = 28000
 const SETTLE_SECONDS = 2
 const TRAIL_STEPS = 10
 
+// Extraction (#9). The thresholds are the line-by-line search cookbook's, the
+// same numbers behind `goal_met`: a present answer reads 0.98 and 0.97, an
+// absent one 0.14. A finding exists only above the present threshold, so the
+// absent band yields no entry by construction.
+const HAS_ANSWER = 0.7 // >= the chosen span is copied into the ledger
+const HAS_ANSWER_ABSENT = 0.35 // the cookbook's absent band; a firing goal_met on a page this low is a disagreement the trace records
+
 const fs = await import('node:fs')
 const HOME = process.env.HOME || ''
 
@@ -69,6 +87,7 @@ const ROOT = ROOTS.find((candidate) => fs.existsSync(`${candidate}/.env`)) || nu
 // time. Not TMPDIR, which the OS reaps, or a login handoff cannot resume after
 // an overnight wait. See spec.md Configuration.
 const JOB_PATH = `${HOME}/.claude/jev-browser/job.json`
+const RUNS_ROOT = `${HOME}/.claude/jev-browser/runs`
 
 // ---------------------------------------------------------------- pure control
 
@@ -166,13 +185,17 @@ export function trailForJev(history) {
 
 // Shave `current_page` first, then the candidate tail. Losing the bottom of the
 // page is cheaper than losing the question, and the API rejects the request
-// outright if the whole thing is over budget.
+// outright if the whole thing is over budget. The extraction ask (#9) sends no
+// candidates, so the final shave is skipped when there is no list to shave.
 export function fitState(state, questions, budget = MAX_REQUEST_CHARS) {
   const size = (candidate) => JSON.stringify({ state: candidate, questions }).length
   if (size(state) <= budget) return state
   const shorter = { ...state, current_page: state.current_page.slice(0, SHORT_PAGE_CHARS) }
   if (size(shorter) <= budget) return shorter
-  return { ...shorter, candidates: shorter.candidates.slice(0, SHORT_CANDIDATES) }
+  return {
+    ...shorter,
+    ...(shorter.candidates ? { candidates: shorter.candidates.slice(0, SHORT_CANDIDATES) } : {}),
+  }
 }
 
 // Jev has no structural invariants (spec.md, Limits), so check the shape before
@@ -301,8 +324,9 @@ export function buildQuestions(candidates) {
       instructions: 'Does `current_page` already contain what `goal` asks for?',
       criteria: { true: 'The page states or directly contains the answer', false: 'It does not' },
     },
-    // Asked here, read by the ledger slice (#9): a page worth reading is where a
-    // finding gets collected. Cheap to ask now, and free in output tokens.
+    // Read by the scroll decision below and by the extraction ask (#9): a page
+    // worth reading is where a finding gets collected. Cheap to ask now, and
+    // free in output tokens.
     worth_reading: {
       type: 'noul',
       instructions: 'Is `current_page` one of the pages `goal` asks us to read?',
@@ -327,6 +351,79 @@ export function buildQuestions(candidates) {
       type: 'noul',
       instructions: 'Is this an interface that `candidates` represents poorly, such as a canvas or virtualized editor?',
       criteria: { true: 'The controls are visual, not in the candidate list', false: 'The candidate list represents it' },
+    },
+  }
+}
+
+// The extraction ask (#9, spec.md "Where findings live"), in its own request:
+// the criteria are lines of the page, so they are as large as the page is, and
+// the main ask's candidate list would pay for them. `has_answer` travels in the
+// same request as its Choice — the shape the form loop validates for fields —
+// because the Choice alone cannot know whether the page holds an answer at all,
+// and `goal_met` alone cannot name the span.
+export function buildExtractionQuestions(spans) {
+  const criteria = {}
+  spans.forEach((span, index) => { criteria[`s${index}`] = span.value })
+  criteria[NO_ANSWER] = 'No line contains the answer'
+
+  return {
+    answer_span: {
+      type: 'choice',
+      instructions: 'Which line contains the answer to `goal`? Choose `none` if no line does.',
+      criteria,
+    },
+    has_answer: {
+      type: 'noul',
+      instructions: 'Does `current_page` contain an answer to `goal`?',
+      criteria: { true: 'The page states or directly contains the answer', false: 'It does not' },
+    },
+  }
+}
+
+// The extraction verdict, pure so the self-check can assert byte-identity
+// against a fixture snapshot. A finding exists only when `has_answer` clears
+// the cookbook's present threshold AND the Choice names a span we offered —
+// validateChoice rejects every other id, so there is no path by which text
+// that appears nowhere on the page reaches the ledger. Code copies the chosen
+// span; nothing is written here.
+export function readExtraction(response, spans, { id, step, url, aspect }) {
+  const verdict = { appended: false }
+
+  let hasAnswer
+  try {
+    hasAnswer = readNoul(response, 'has_answer')
+  } catch (error) {
+    return { ...verdict, reason: 'invalid_response', detail: error.message }
+  }
+  verdict.has_answer = hasAnswer
+  if (hasAnswer < HAS_ANSWER) return { ...verdict, reason: 'has_answer_low' }
+
+  let pick
+  try {
+    pick = validateChoice(response, 'answer_span', [...spans.map((_, index) => `s${index}`), NO_ANSWER])
+  } catch (error) {
+    return { ...verdict, reason: 'invalid_response', detail: error.message }
+  }
+  verdict.span_choice = pick.choice
+  verdict.confidence = pick.confidence
+  // A span picked from the absent band is a self-contradiction: mark it, so the
+  // trace line shows the disagreement with a firing `goal_met` without reading
+  // two numbers against each other.
+  if (hasAnswer < HAS_ANSWER_ABSENT) verdict.absent = true
+  if (pick.choice === NO_ANSWER) return { ...verdict, reason: 'span_none' }
+
+  const span = spans[Number(pick.choice.slice(1))]
+  return {
+    ...verdict,
+    appended: true,
+    finding: {
+      id,
+      step,
+      url,
+      aspect,
+      value: span.value, // code copied: byte-identical to the snapshot, never generated
+      evidence: span.evidence, // the exact line it was read from
+      confidence: pick.confidence,
     },
   }
 }
@@ -444,6 +541,12 @@ async function reveal(target) {
 const usageTotal = { requests: 0 }
 let modelSeen = null
 
+// The run directory of the live round (#9), set once main has resolved it.
+// Every exit object names it, with the ledger and trace paths, so the caller
+// can write `run_dir` back into job.json and round N+1 appends to the same
+// artifacts instead of starting a new collection.
+let ACTIVE_RUN = null
+
 function tally(response) {
   usageTotal.requests += 1
   modelSeen = response.model ?? modelSeen
@@ -466,6 +569,9 @@ function exitObject({ status, reason, detail, step, steps, state, extra = {} }) 
     // The caller records this when it rewrites job.json, which is what lets the
     // next round refuse to escalate twice on the same page.
     page_fingerprint: state?.fingerprint ?? null,
+    // The run artifacts (#9). A round that exited before the run directory
+    // existed collected nothing, so it names none.
+    ...(ACTIVE_RUN ? { run_dir: ACTIVE_RUN.dir, ledger: ACTIVE_RUN.ledger, trace: ACTIVE_RUN.trace } : {}),
   }
   return { ...base, ...extra }
 }
@@ -477,6 +583,52 @@ async function onTheStartPage(startUrl) {
   } catch {
     return false
   }
+}
+
+// One extraction (#9): spans from the visible snapshot, one ask, and on a clear
+// verdict the ledger append. Firing is the loop's decision — `goal_met` fired,
+// or the page reads as worth reading, and this fingerprint has not been
+// harvested yet. `known` is the round's in-memory mirror of the ledger, seeded
+// from the file at round start, so ids, the digest, and the duplicate guard all
+// span rounds.
+async function harvest({ observed, step, goal, key, ledgerPath, known }) {
+  const spans = answerSpans(observed.pageText)
+  if (spans.length === 0) return { asked: false, reason: 'no_spans' }
+
+  // `current_page` is the joined spans — the page's own text, annotation-free —
+  // so `has_answer` reads the same lines the Choice offers and the page is not
+  // paid for twice in one request.
+  const questions = buildExtractionQuestions(spans)
+  const state = fitState({
+    goal,
+    current_page: spans.map((span) => span.value).join('\n'),
+    digest: digestOf(known),
+  }, questions)
+
+  const startedAt = Date.now()
+  const response = await ask({ model: MODEL, state, questions }, key)
+  tally(response)
+  const latencyMs = Date.now() - startedAt
+
+  const verdict = readExtraction(response, spans, {
+    id: `f${known.length + 1}`,
+    step,
+    url: observed.url,
+    aspect: goal.slice(0, MAX_ASPECT_CHARS),
+  })
+  if (verdict.appended) {
+    if (findingIsDuplicate(verdict.finding, known)) {
+      return {
+        asked: true, latency_ms: latencyMs, usage: response.usage ?? null,
+        ...verdict, appended: false, reason: 'already_in_ledger',
+      }
+    }
+    // The payload write. Allowed to throw: a finding lost silently is the one
+    // failure this slice must not have.
+    appendFinding(ledgerPath, verdict.finding)
+    known.push(verdict.finding)
+  }
+  return { asked: true, latency_ms: latencyMs, usage: response.usage ?? null, ...verdict }
 }
 
 async function main() {
@@ -491,6 +643,23 @@ async function main() {
   const job = JSON.parse(fs.readFileSync(JOB_PATH, 'utf8'))
   const key = await readKey()
   const budget = job.step_budget ?? 12
+
+  // The run directory (#9): reused when the caller recorded `run_dir` from the
+  // last exit, created fresh otherwise. Round N+1 after an escalate appends to
+  // the same ledger instead of orphaning a partially completed collection.
+  const run = resolveRunDir(job, {
+    runsRoot: RUNS_ROOT,
+    exists: (path) => fs.existsSync(path),
+    mkdirp: (path) => fs.mkdirSync(path, { recursive: true }),
+  })
+  ACTIVE_RUN = run
+  // The in-memory mirror of the ledger: seeded from the file, so ids, the
+  // digest, and the duplicate guard all span rounds.
+  const findings = readFindings(run.ledger)
+  // Fingerprints already harvested, seeded from what the caller recorded out of
+  // the last exit, so a resumed round neither re-asks a harvested page nor
+  // duplicates its finding.
+  const harvested = new Set(job.harvested_fingerprints ?? [])
 
   const visited = new Set(job.visited_fingerprints ?? [])
   const escalated = new Set(job.escalated_fingerprints ?? [])
@@ -536,8 +705,48 @@ async function main() {
     : spentLabels.has(candidate.label))
   const anySpent = () => spentUrls.size > 0 || spentLabels.size > 0
 
+  // Per-step trace state (#9): the answers and the extraction verdict of this
+  // step's ask, written into the step's trace line when its decision is
+  // recorded. `prevTracePoint` is what `page_changed` compares against.
+  let stepAnswers = null
+  let stepExtraction = null
+  let prevTracePoint = null
+  const writeTrace = (entry) => {
+    if (!ACTIVE_RUN) return
+    appendTrace(ACTIVE_RUN.trace, {
+      step: entry.step,
+      url: entry.url,
+      fingerprint: entry.fingerprint,
+      sy: entry.sy ?? null,
+      page_changed: pageChanged(prevTracePoint, entry, PROGRESS_SY_EPSILON),
+      candidates: entry.candidates,
+      decision: entry.decision,
+      ...(entry.label ? { label: entry.label } : {}),
+      ...(entry.target_url ? { target_url: entry.target_url } : {}),
+      ...(entry.revisit ? { revisit: true } : {}),
+      ...(entry.error ? { error: entry.error } : {}),
+      answers: stepAnswers,
+      ...(stepExtraction ? { extraction: stepExtraction } : {}),
+      latency_ms: entry.latency_ms,
+      usage: entry.usage,
+      model: modelSeen,
+    })
+    prevTracePoint = { fingerprint: entry.fingerprint, sy: entry.sy ?? null }
+  }
+
+  // Every escalate reads the ledger back rather than trusting the mirror, so
+  // what the exit claims as partial is what is on disk (#9): a partially
+  // completed collection is never discarded. The harvested fingerprints ride
+  // along for the caller to record, exactly like `visited_fingerprints`.
+  const ledgerExtras = () => ({
+    partial_findings: readFindings(run.ledger),
+    harvested_fingerprints: [...harvested],
+  })
+
   while (true) {
     steps += 1
+    stepAnswers = null
+    stepExtraction = null
     let observed = await observe()
 
     // The start check rides on the loop's own observation channel (#11): a
@@ -550,6 +759,16 @@ async function main() {
       await gotoAndWait(job.start_url, { timeout: 20 })
       const reobserved = await observe()
       if (!matchesStartUrl(reobserved.url, job.start_url)) {
+        writeTrace({
+          step: steps,
+          url: reobserved.url,
+          fingerprint: reobserved.fingerprint,
+          sy: reobserved.sy,
+          candidates: reobserved.candidates.length,
+          decision: 'stop:start_url_mismatch',
+          latency_ms: null,
+          usage: null,
+        })
         return exitObject({
           status: 'escalate',
           reason: 'start_url_mismatch',
@@ -602,21 +821,41 @@ async function main() {
         }
         revisitPending = true
       } else {
+        writeTrace({
+          step: steps,
+          url: observed.url,
+          fingerprint: observed.fingerprint,
+          sy: observed.sy,
+          candidates: observed.candidates.length,
+          decision: 'stop:repeat_page',
+          latency_ms: null,
+          usage: null,
+        })
         return exitObject({
           status: 'escalate',
           reason: 'repeat_page',
           step: steps,
           state: observed,
-          extra: { goal: job.goal, partial_findings: [], trail: history.slice(-TRAIL_STEPS) },
+          extra: { goal: job.goal, trail: history.slice(-TRAIL_STEPS), ...(ledgerExtras()) },
         })
       }
     } else if (stop) {
+      writeTrace({
+        step: steps,
+        url: observed.url,
+        fingerprint: observed.fingerprint,
+        sy: observed.sy,
+        candidates: observed.candidates.length,
+        decision: `stop:${stop.reason}`,
+        latency_ms: null,
+        usage: null,
+      })
       return exitObject({
         status: 'escalate',
         reason: stop.reason,
         step: steps,
         state: observed,
-        extra: { goal: job.goal, partial_findings: [], trail: history.slice(-TRAIL_STEPS) },
+        extra: { goal: job.goal, trail: history.slice(-TRAIL_STEPS), ...(ledgerExtras()) },
       })
     }
 
@@ -637,42 +876,82 @@ async function main() {
       // for code (spending), never for the request.
       candidates: candidates.map(({ ref, label, count }) => ({ ref, label, count })),
       trail: trailForJev(history),
+      // The bounded projection of the ledger (#9): what is already collected,
+      // so `goal_met` does not fire early on a multi-item goal and a page whose
+      // finding is already in the ledger is not re-opened.
+      digest: digestOf(findings),
     }, questions)
 
     const startedAt = Date.now()
     const response = await ask({ model: MODEL, state, questions }, key)
     const latencyMs = Date.now() - startedAt
     tally(response)
+    stepAnswers = answersOf(response)
 
     const decision = readDecision({ response, candidates, retried })
+
+    // Extraction (#9). `goal_met` is a probability, not a value — it cannot
+    // produce a finding. When it fires, or the page reads as one the goal asks
+    // us to read, the extraction ask pairs the span Choice with `has_answer`,
+    // and code copies the chosen span into the ledger. Once per page
+    // fingerprint: the digest, the caller-carried `harvested_fingerprints`, and
+    // the ledger's own duplicate guard keep a multi-item goal from re-collecting
+    // an item it already has.
+    let worthReading = 0
+    try {
+      worthReading = readNoul(response, 'worth_reading')
+    } catch {
+      // A malformed worth_reading collects nothing; it is not this step's job
+      // to fail the round over it.
+    }
+    if ((decision.kind === 'done' || worthReading > WORTH_READING) && !harvested.has(observed.fingerprint)) {
+      harvested.add(observed.fingerprint)
+      stepExtraction = await harvest({
+        observed,
+        step: steps,
+        goal: job.goal,
+        key,
+        ledgerPath: run.ledger,
+        known: findings,
+      })
+    }
+
     const record = {
       step: steps,
       url: observed.url,
       fingerprint: observed.fingerprint,
+      sy: observed.sy,
       candidates: candidates.length,
       latency_ms: latencyMs,
       usage: response.usage ?? null,
+      // The granted re-decision rides on the step's own record rather than as a
+      // separate trail entry, so one step is one trace line (#9).
+      ...(revisitPending ? { revisit: true } : {}),
     }
     const recorded = (what, extra = {}) => {
-      history.push({ ...record, decision: what, ...extra })
+      const entry = { ...record, decision: what, ...extra }
+      history.push(entry)
+      writeTrace(entry)
       return history.slice(-TRAIL_STEPS)
     }
-    if (revisitPending) recorded('revisit')
 
     if (decision.kind === 'done') {
-      // The ledger is slice #9, so an empty findings list is the correct outcome
-      // here: this slice is the loop, the guards, and the exits.
+      // The findings are read back from the ledger, not from the mirror: the
+      // file is the payload, and what the exit claims is what is on disk (#9).
+      // An empty ledger is a correct `done` — a goal answered on a page with
+      // nothing left to collect.
       return exitObject({
         status: 'done',
         steps,
         state: observed,
         extra: {
           goal: job.goal,
-          findings: [],
+          findings: readFindings(run.ledger),
           model: response.model,
           task_space_id: task.id,
           goal_met: readNoul(response, 'goal_met'),
           usage: response.usage ?? null,
+          harvested_fingerprints: [...harvested],
           trail: recorded('done'),
         },
       })
@@ -683,8 +962,8 @@ async function main() {
         goal: job.goal,
         model: response.model,
         task_space_id: task.id,
-        partial_findings: [],
         trail: recorded(`escalate:${decision.reason}`),
+        ...(ledgerExtras()),
         ...(decision.detail ? { detail: decision.detail } : {}),
       }
       // Credentials are a user problem, not a judgment call: hand the space over
@@ -744,7 +1023,7 @@ async function main() {
           reason: 'stale_page',
           step: steps,
           state: fresh,
-          extra: { goal: job.goal, partial_findings: [], trail },
+          extra: { goal: job.goal, trail, ...(ledgerExtras()) },
         })
       }
       continue
@@ -1031,6 +1310,186 @@ async function runSelfCheck() {
   assert.ok(asked.next_target.criteria.none && !asked.next_target.criteria['@1'], 'criteria are the offered ids')
   assert.equal(asked.next_target.criteria['@2'], 'Help')
 
+  // ---- run artifacts (#9): run dir, ledger, digest, spans, trace helpers ----
+
+  const ledger = await import(new URL('./ledger.js', import.meta.url).href)
+
+  // The run directory: created fresh when job.json carries none, reused when
+  // the caller recorded one from the last exit — which is how round N+1 after
+  // an escalate appends to the same ledger instead of orphaning it.
+  let madeCalls = 0
+  const made = ledger.resolveRunDir({ goal: 'Collect prices of 3 items!' }, {
+    runsRoot: '/tmp/runs-root',
+    exists: () => false,
+    mkdirp: () => { madeCalls += 1 },
+  })
+  assert.equal(made.reused, false, 'no run_dir in the job, a fresh directory')
+  assert.ok(made.dir.startsWith('/tmp/runs-root/'), 'the run directory lives under the runs root')
+  assert.ok(made.dir.endsWith('-collect-prices-of-3-items'), 'the slug is the goal, filename-safe')
+  assert.equal(made.ledger, `${made.dir}/ledger.jsonl`, 'the ledger path rides with the dir')
+  assert.equal(madeCalls, 1, 'creating makes exactly one directory')
+  madeCalls = 0
+  const reused = ledger.resolveRunDir(
+    { goal: 'g', run_dir: made.dir },
+    { runsRoot: '/tmp/runs-root', exists: () => true, mkdirp: () => { madeCalls += 1 } },
+  )
+  assert.equal(reused.dir, made.dir, 'a recorded run_dir is reused verbatim')
+  assert.equal(reused.reused, true, 'and marked as a reuse')
+  assert.equal(madeCalls, 0, 'reusing makes no directory')
+  // The guard on a claimed run_dir: it must be one path segment directly inside
+  // the runs root, so a traversal or a foreign path cannot redirect the payload.
+  for (const evil of ['/etc/passwd', '/tmp/runs-root/../steal', '/tmp/runs-root/a/b', '/tmp/runs-root/..', '/tmp/runs-root']) {
+    const refused = ledger.resolveRunDir(
+      { goal: 'g', run_dir: evil },
+      { runsRoot: '/tmp/runs-root', exists: () => true, mkdirp: () => { madeCalls += 1 } },
+    )
+    assert.equal(refused.reused, false, `refused ${evil}`)
+    assert.ok(refused.dir.startsWith('/tmp/runs-root/'), `a fresh dir for ${evil}`)
+  }
+  assert.equal(madeCalls, 5, 'each refusal created its fresh directory')
+
+  // The ledger round trip: one JSON line per finding, appended as collected.
+  // A torn tail line — a crash mid-append — is skipped, never fatal.
+  const os = await import('node:os')
+  const scratch = fs.mkdtempSync(`${os.tmpdir()}/jev-explore-check-`)
+  const ledgerPath = `${scratch}/ledger.jsonl`
+  assert.deepEqual(ledger.readFindings(ledgerPath), [], 'no file yet, an empty ledger')
+  ledger.appendFinding(ledgerPath, { id: 'f1', value: 'first' })
+  ledger.appendFinding(ledgerPath, { id: 'f2', value: 'second' })
+  fs.appendFileSync(ledgerPath, '{torn\n')
+  assert.deepEqual(
+    ledger.readFindings(ledgerPath).map((finding) => finding.id),
+    ['f1', 'f2'],
+    'append, read back, torn line skipped',
+  )
+
+  // The duplicate guard: same url and same copied span is the same finding.
+  assert.equal(
+    ledger.findingIsDuplicate({ url: 'https://x/', value: 'v' }, [{ url: 'https://x/', value: 'v' }]),
+    true,
+    'same url and value is a duplicate',
+  )
+  assert.equal(
+    ledger.findingIsDuplicate({ url: 'https://x/', value: 'v' }, [{ url: 'https://y/', value: 'v' }]),
+    false,
+    'a different page is a different finding',
+  )
+
+  // The digest: whatever the ledger grows to, Jev's projection stays bounded —
+  // the last 20 entries, values and aspects trimmed, step kept.
+  const hundred = Array.from({ length: 100 }, (_, index) => ({
+    aspect: `aspect ${index}`, value: `v${index}`, step: index,
+  }))
+  const projected = ledger.digestOf(hundred)
+  assert.equal(projected.length, ledger.DIGEST_ENTRIES, 'the digest is bounded at 20 entries')
+  assert.deepEqual(projected[0], { aspect: 'aspect 80', value: 'v80', step: 80 }, 'the tail is what survives')
+  assert.equal(ledger.digestOf([{ aspect: 'a'.repeat(200), value: 'v'.repeat(200), step: 1 }])[0].value.length, ledger.DIGEST_VALUE_CHARS, 'a value is trimmed')
+  assert.equal(ledger.digestOf([{ aspect: 'a'.repeat(200), value: 'v', step: 1 }])[0].aspect.length, ledger.DIGEST_ASPECT_CHARS, 'an aspect is trimmed')
+
+  // Extraction spans from the fixture page. Every span's value and evidence is
+  // byte-identical to the snapshot — asserted against the file, not by eye.
+  const answerPage = fs.readFileSync(new URL('./fixtures/answer-page.txt', import.meta.url), 'utf8')
+  const spans = ledger.answerSpans(answerPage)
+  assert.ok(spans.length > 0, 'the fixture yields spans')
+  for (const span of spans) {
+    assert.ok(answerPage.includes(span.value), `value byte-identical: ${JSON.stringify(span.value.slice(0, 40))}`)
+    assert.ok(answerPage.includes(span.evidence), `evidence is the exact line: ${JSON.stringify(span.evidence.slice(0, 40))}`)
+  }
+  const price = spans.find((span) => span.value === 'Price: $12.00')
+  assert.deepEqual(price, { value: 'Price: $12.00', evidence: 'text "Price: $12.00"' }, 'the answer span names its line')
+  assert.equal(
+    spans.filter((span) => span.value === 'Read more').length,
+    1,
+    'repeated lines collapse onto the first',
+  )
+  assert.ok(
+    spans.every((span) => span.value.length <= ledger.MAX_SPAN_CHARS),
+    'a span is truncated without inventing text',
+  )
+  const long = spans.find((span) => span.value.startsWith('Seasonal note'))
+  assert.ok(long && long.value.length === ledger.MAX_SPAN_CHARS, 'a long line is sliced, never ellipsised')
+  assert.ok(!long.value.includes('…'), 'no ellipsis: the span must remain text the page holds')
+  assert.ok(!spans.some((span) => span.value === 'root'), 'structure lines are not page text')
+
+  // The extraction verdict. A finding exists only above the present threshold
+  // AND on a span we offered; code copies it, and the copy is asserted against
+  // the snapshot.
+  const extractionSpans = ledger.answerSpans(answerPage)
+  const extractionIds = [...extractionSpans.map((_, index) => `s${index}`), 'none']
+  const extractionResponse = (hasAnswer, choice) => ({
+    answers: {
+      has_answer: { type: 'noul', noul: hasAnswer },
+      answer_span: {
+        type: 'choice',
+        choice,
+        confidence: 0.94,
+        // A distribution validateChoice will accept: the argmax on the pick,
+        // the remainder spread over the rest.
+        probabilities: Object.fromEntries(
+          extractionIds.map((id) => [id, id === choice ? 0.8 : 0.2 / (extractionIds.length - 1)]),
+        ),
+      },
+    },
+  })
+  const priceIndex = extractionSpans.findIndex((span) => span.value === 'Price: $12.00')
+  const collected = readExtraction(
+    extractionResponse(0.94, `s${priceIndex}`),
+    extractionSpans,
+    { id: 'f1', step: 4, url: 'https://shop.example.com/search', aspect: 'the price of the cheapest desk lamp' },
+  )
+  assert.equal(collected.appended, true, 'a page holding the answer yields an entry')
+  assert.equal(collected.finding.value, 'Price: $12.00', 'the value is the chosen span, copied')
+  assert.equal(collected.finding.evidence, 'text "Price: $12.00"', 'the evidence is the exact line')
+  assert.ok(answerPage.includes(collected.finding.value), 'byte-identical to the snapshot')
+  assert.ok(answerPage.includes(collected.finding.evidence), 'evidence byte-identical too')
+  assert.equal(collected.finding.confidence, 0.94, 'the pick carries its confidence')
+
+  // A page not containing the answer yields no entry, and has_answer reads low.
+  const absent = readExtraction(extractionResponse(0.14, 's0'), extractionSpans, { id: 'f1', step: 4, url: 'u', aspect: 'a' })
+  assert.equal(absent.appended, false, 'no entry below the present threshold')
+  assert.equal(absent.reason, 'has_answer_low', 'the absent band says so')
+  // And the generation path does not exist: a Choice naming an id we never
+  // offered is rejected wholesale, so no off-page text can be copied.
+  const foreign = readExtraction(extractionResponse(0.94, 's999'), extractionSpans, { id: 'f1', step: 4, url: 'u', aspect: 'a' })
+  assert.equal(foreign.appended, false, 'an unoffered id collects nothing')
+  assert.equal(foreign.reason, 'invalid_response', 'and says why')
+  const none = readExtraction(extractionResponse(0.94, 'none'), extractionSpans, { id: 'f1', step: 4, url: 'u', aspect: 'a' })
+  assert.equal(none.appended, false, 'an answer the model cannot name is no entry')
+  assert.equal(none.reason, 'span_none', 'without inventing one')
+  const malformed = readExtraction(
+    { answers: { has_answer: { type: 'noul', noul: 'yes' } } },
+    extractionSpans,
+    { id: 'f1', step: 4, url: 'u', aspect: 'a' },
+  )
+  assert.equal(malformed.appended, false, 'a malformed has_answer collects nothing')
+
+  // The extraction request has no candidates to shave, and still fits.
+  const extractionQuestions = buildExtractionQuestions(extractionSpans)
+  assert.equal(extractionQuestions.answer_span.type, 'choice', 'one span Choice')
+  assert.equal(extractionQuestions.has_answer.type, 'noul', 'one has_answer Noul beside it')
+  assert.deepEqual(
+    Object.keys(extractionQuestions.answer_span.criteria).sort(),
+    extractionIds.sort(),
+    'the criteria are exactly the offered span ids plus none',
+  )
+  const snug = { goal: 'g', current_page: 'x', digest: [] }
+  assert.equal(fitState(snug, extractionQuestions), snug, 'a fitting extraction request is untouched')
+  const fat = { goal: 'g', current_page: 'p'.repeat(40000), digest: projected }
+  assert.ok(JSON.stringify(fitState(fat, extractionQuestions)).length < JSON.stringify(fat).length, 'an oversized one is shaved')
+
+  // The trace helpers: page_changed is the no-progress rule, null on the first
+  // line; answers flatten for the trace, Nouls to numbers, Choices whole.
+  assert.equal(ledger.pageChanged(null, { fingerprint: 'f', sy: 0 }, PROGRESS_SY_EPSILON), null, 'no previous step, no page_changed')
+  assert.equal(ledger.pageChanged({ fingerprint: 'a', sy: 0 }, { fingerprint: 'a', sy: 0 }, PROGRESS_SY_EPSILON), false, 'same page, same scroll')
+  assert.equal(ledger.pageChanged({ fingerprint: 'a', sy: 0 }, { fingerprint: 'b', sy: 0 }, PROGRESS_SY_EPSILON), true, 'a page change')
+  assert.equal(ledger.pageChanged({ fingerprint: 'a', sy: 100 }, { fingerprint: 'a', sy: 900 }, PROGRESS_SY_EPSILON), true, 'a scroll counts')
+  assert.equal(ledger.pageChanged({ fingerprint: 'a', sy: 100 }, { fingerprint: 'a', sy: 104 }, PROGRESS_SY_EPSILON), false, 'drift under the epsilon does not')
+  assert.deepEqual(
+    ledger.answersOf({ answers: { goal_met: { type: 'noul', noul: 0.9 }, next_target: { type: 'choice', choice: '@1', confidence: 0.8, probabilities: { '@1': 1 } } } }),
+    { goal_met: 0.9, next_target: { choice: '@1', confidence: 0.8, probabilities: { '@1': 1 } } },
+    'the trace carries the probabilities',
+  )
+
   return Object.keys(asked).length
 }
 
@@ -1044,11 +1503,16 @@ if (process.argv[1] && process.argv[1].endsWith('explore.js')) {
   try {
     result = await main()
   } catch (error) {
-    // One JSON object out, always, even on failure. The message never carries the key.
+    // One JSON object out, always, even on failure. The message never carries
+    // the key, and whatever the ledger already holds rides out (#9): the
+    // findings are the deliverable, error or not.
     result = exitObject({
       status: 'escalate',
       reason: 'error',
-      extra: { detail: String(error && error.message ? error.message : error) },
+      extra: {
+        detail: String(error && error.message ? error.message : error),
+        ...(ACTIVE_RUN ? { partial_findings: readFindings(ACTIVE_RUN.ledger) } : {}),
+      },
     })
   }
   cliLog(JSON.stringify(result))

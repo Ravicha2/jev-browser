@@ -326,6 +326,8 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | Signal | Threshold | Action |
 |---|---|---|
 | `goal_met.noul` | >= 0.8 | exit done |
+| `has_answer.noul` | >= 0.7 | the extraction ask's chosen span is copied into the ledger as a finding |
+| `has_answer.noul` | < 0.35 | the cookbook's absent band: no entry. A firing `goal_met` on a page this low is a disagreement the trace records. |
 | `next_target.confidence` | < 0.5 | retry once over the same list, then escalate |
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
 | `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
@@ -407,6 +409,15 @@ token usage, and latency. Never sent to Jev. M1 needs exactly these numbers and 
 
 `visited_fingerprints` stays control-only and never enters `state`.
 
+The loop writes all three (#9). The exit object names the run directory, the
+ledger, and the trace; the caller copies `run_dir` into `job.json`, which is how
+round N+1 appends to the same ledger instead of starting a new one. Extraction
+fires when `goal_met` crosses its threshold or `worth_reading` clears 0.5 —
+once per page fingerprint, carried across rounds in `harvested_fingerprints`,
+which the caller records exactly like `visited_fingerprints`. Spans come from
+the **visible** tree only: a span cut from the full tree would be off-screen
+text Jev was never shown.
+
 ### The extraction question
 
 `goal_met` returns a probability, not a value, so it cannot produce a finding on its own.
@@ -436,10 +447,12 @@ because the heredoc's working directory is not the caller's:
   "task_space_id": 3,
   "goal": "fill the company registration form from the user's details",
   "start_url": "https://example.com/register",
+  "run_dir": "~/.claude/jev-browser/runs/2026-09-21T14-03-29-812Z-fill-the-company-registration-form",
   "supplied_values": { "vat_number": "IE1234567X", "search_query": "" },
   "step_budget": 20,
   "settled_refs": ["@20", "vat_number"],
   "visited_fingerprints": ["a1b2c3:vat_number"],
+  "harvested_fingerprints": [],
   "escalated_fingerprints": []
 }
 ```
@@ -467,10 +480,12 @@ re-asks.
 `visited_fingerprints` is carried across rounds so the ping-pong guard still works after a
 resume, and `escalated_fingerprints` is what the ping-pong guard reads for escalations. A
 round reports the fingerprint it stopped on in its exit object; the caller records it when
-it rewrites `job.json`, because the loop never writes the job file it was handed. Nothing
-is passed through the shell — the goal and the answer travel only inside `job.json` and
-JSON bodies — so a goal string containing quotes, backticks, or newlines cannot break the
-invocation.
+it rewrites `job.json`, because the loop never writes the job file it was handed. The same
+contract carries the run artifacts (#9): every exit names `run_dir`, `ledger`, and `trace`,
+and the caller copies `run_dir` — and `harvested_fingerprints`, so a resumed round does not
+re-collect a harvested page — back into `job.json`. Nothing is passed through the shell —
+the goal and the answer travel only inside `job.json` and JSON bodies — so a goal string
+containing quotes, backticks, or newlines cannot break the invocation.
 
 ## Packaging as a skill
 
