@@ -115,7 +115,26 @@ export function offerTrace(entry) {
   return {
     ...(entry.offered ? { offered: entry.offered } : {}),
     ...(entry.picked_index == null ? {} : { picked_index: entry.picked_index }),
+    ...(entry.states && Object.keys(entry.states).length ? { states: entry.states } : {}),
   }
+}
+
+// One row of the offer as Jev sees it (#30). The list is 64 to 73 entries on the
+// page this was measured on, and a flat run of labels makes a goal that names a
+// position unanswerable: nothing said which entry was first, so "the first job
+// listing" was answered with a plausible one (measured: the pick landed on the
+// first job card anyway, 23 rows into a 65-row offer, so the entry is findable
+// and the offer never said so).
+//
+// The number is the row's index in the offer, and `state` rides in the same
+// string because `criteria` is a flat {ref: text} map — a second field per row
+// would be a protocol change for a fact one string carries. What the candidate
+// object itself keeps is the bare label: the trail, the spend key and
+// `resolveTarget` all outlive this step, and a number that moves when a spent
+// row drops out would stop matching them.
+export function offerRow(candidate, index) {
+  const state = candidate.state ? ` (${candidate.state})` : ''
+  return { ref: candidate.ref, label: `${index + 1}. ${candidate.label}${state}`, count: candidate.count }
 }
 
 // Spend a path: the url when there is one, the label only as the fallback for
@@ -384,7 +403,7 @@ export function buildQuestions(candidates) {
   return {
     next_target: {
       type: 'choice',
-      instructions: 'Which candidate is most likely to lead toward `goal`? Choose `none` if none does.',
+      instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list, and a row marked (current), (selected) or (expanded) is already open. Choose `none` if none does.',
       criteria,
     },
     goal_met: {
@@ -569,6 +588,21 @@ async function observe() {
     currentUrl: info.url,
   })
 
+  // Row state (#30). The accessibility tree annotates a node with ref, loc and
+  // url and nothing else — measured on the guest LinkedIn search page, zero
+  // state lines in a 658-line tree — so a control that is already open or
+  // already selected looks exactly like one that is not, which is why the card
+  // whose detail panel is already displayed reads as a good pick. The DOM does
+  // carry it: `aria-current`, `aria-selected`, `aria-expanded`. One query per
+  // step, on the selector each candidate's loc already is, walking up a few
+  // levels because LinkedIn marks the card's wrapper rather than the anchor the
+  // offer names. The offer is unaffected by it: the fingerprint hashes label and
+  // count, and a state flip does not move the page.
+  const marks = await stateMarks(page, candidates)
+  for (const candidate of candidates) {
+    if (marks[candidate.ref]) candidate.state = marks[candidate.ref]
+  }
+
   return {
     url: info.url,
     sy: info.sy,
@@ -578,6 +612,36 @@ async function observe() {
     commitOnly: candidates.length === 0 && commitCount > 0,
     fingerprint: await pageFingerprint(info.url, candidates),
   }
+}
+
+// Which offered candidates the page already has open, selected or expanded
+// (#30), keyed by ref. A candidate with no `css:` loc (an anchor whose loc is
+// its href, say) has no selector to ask about and is simply not marked: a
+// missing state is the same answer as "no state", so nothing downstream has to
+// tell the two apart. `parseSnapshot` is prune's own parse, so the tree is read
+// exactly as the offer was built from it.
+async function stateMarks(snapshotText, candidates) {
+  const selectors = {}
+  const wanted = new Set(candidates.map((candidate) => candidate.ref))
+  for (const line of parseSnapshot(snapshotText)) {
+    const ref = line.ref ? `@${line.ref}` : null
+    if (ref && wanted.has(ref) && line.loc?.startsWith('css:')) selectors[ref] = line.loc.slice(4)
+  }
+  if (Object.keys(selectors).length === 0) return {}
+  return js(`(() => {
+    const out = {}
+    for (const [ref, selector] of Object.entries(${JSON.stringify(selectors)})) {
+      let element
+      try { element = document.querySelector(selector) } catch { element = null }
+      for (let level = 0; element && level < 4; level += 1, element = element.parentElement) {
+        const current = element.getAttribute('aria-current')
+        if (current && current !== 'false') { out[ref] = 'current'; break }
+        if (element.getAttribute('aria-selected') === 'true') { out[ref] = 'selected'; break }
+        if (element.getAttribute('aria-expanded') === 'true') { out[ref] = 'expanded'; break }
+      }
+    }
+    return out
+  })()`)
 }
 
 // An offered candidate can sit below the fold, so a pick may name something
@@ -996,13 +1060,18 @@ async function main() {
         extra: { goal: job.goal, trail: history.slice(-TRAIL_STEPS), ...(ledgerExtras()) },
       })
     }
-    const questions = buildQuestions(candidates)
+    // The offer rows (#30): the same candidates the decision resolves against,
+    // written once so the Choice criteria and the `candidates` field cannot
+    // disagree about what row 23 is.
+    const offered = candidates.map(offerRow)
+    const questions = buildQuestions(offered)
     const state = fitState({
       goal: job.goal,
       current_page: observed.pageText.slice(0, MAX_PAGE_CHARS),
-      // ref, label, count are all Jev gets of a candidate: the target url is
-      // for code (spending), never for the request.
-      candidates: candidates.map(({ ref, label, count }) => ({ ref, label, count })),
+      // ref, label and count are all Jev gets of a candidate: the target url is
+      // for code (spending), never for the request, and the label it gets is the
+      // numbered offer row, not the bare one the loop matches on.
+      candidates: offered,
       trail: trailForJev(history),
       // The bounded projection of the ledger (#9): what is already collected,
       // so `goal_met` does not fire early on a multi-item goal and a page whose
@@ -1055,6 +1124,8 @@ async function main() {
       // of it, which is the question the offer's shape turns on.
       offered: candidates.map((candidate) => candidate.ref),
       picked_index: decision.kind === 'click' ? decision.index : null,
+      states: Object.fromEntries(candidates.filter((candidate) => candidate.state)
+        .map((candidate) => [candidate.ref, candidate.state])),
       latency_ms: latencyMs,
       usage: response.usage ?? null,
       // The granted re-decision rides on the step's own record rather than as a
@@ -1615,9 +1686,30 @@ async function runSelfCheck() {
   assert.throws(() => readNoul({ answers: {} }, 'goal_met'))
 
   // The trust boundary travels: no commit-like label can reach the questions.
-  const asked = buildQuestions([{ ref: '@2', label: 'Help' }])
+  const asked = buildQuestions([{ ref: '@2', label: 'Help' }].map(offerRow))
   assert.ok(asked.next_target.criteria.none && !asked.next_target.criteria['@1'], 'criteria are the offered ids')
-  assert.equal(asked.next_target.criteria['@2'], 'Help')
+  assert.equal(asked.next_target.criteria['@2'], '1. Help')
+
+  // The offer row (#30): the position, then the label, then the state. A flat
+  // list of labels cannot answer "the first job listing" — measured on the
+  // LinkedIn search page, that entry is row 23 of a 65-row offer, behind 21
+  // chrome rows, and the offer never said which row was first.
+  const rows = [
+    { ref: '@1', label: 'Engineer', count: 1 },
+    { ref: '@2', label: 'Forward Deployed Designer', count: 1, state: 'current' },
+  ].map(offerRow)
+  assert.deepEqual(rows[0], { ref: '@1', label: '1. Engineer', count: 1 }, 'the first row is numbered')
+  assert.deepEqual(
+    rows[1],
+    { ref: '@2', label: '2. Forward Deployed Designer (current)', count: 1 },
+    'an already-open row carries its state',
+  )
+  const rowsAsked = buildQuestions(rows)
+  assert.equal(rowsAsked.next_target.criteria['@2'], '2. Forward Deployed Designer (current)', 'the criteria carry the whole row')
+  // The candidate object keeps the bare label: the trail, the spend key and
+  // `resolveTarget` compare against it, and a number that moves when a spent
+  // row drops out would stop matching any of them.
+  assert.equal(decided(response(sure)).label, 'Read more', 'the decision label is the bare one, not the numbered row')
 
   // ---- run artifacts (#9): run dir, ledger, digest, spans, trace helpers ----
 
