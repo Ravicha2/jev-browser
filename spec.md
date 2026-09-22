@@ -327,6 +327,7 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 |---|---|---|
 | `goal_met.noul` | >= 0.8 | exit done |
 | `has_answer.noul` | >= 0.7 | the extraction ask's chosen span is copied into the ledger as a finding |
+| `has_answer.noul` | >= 0.35, < 0.7 | the chosen span is copied with `tentative: true`: the model named a line its own `has_answer` did not back, and the round would otherwise end with an empty ledger |
 | `has_answer.noul` | < 0.35 | the cookbook's absent band: no entry. A firing `goal_met` on a page this low is a disagreement the trace records. |
 | `next_target.confidence` | < 0.5 | retry once over the same list, then escalate |
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
@@ -398,6 +399,10 @@ A finding is a *selected span*, never generated text:
 `value` and `evidence` are copied from the page by code. Jev chooses which span; code copies
 it. Making Jev write the value would break its "cannot generate text" limit, so extraction has
 to be selection, which is also the pattern the docs validate.
+
+`tentative: true` rides on the finding the model chose between the absent and present
+thresholds (#15): a span its own `has_answer` did not back, kept rather than discarded.
+Above the present threshold the field is absent.
 
 **The digest is what Jev sees.** A bounded projection of the ledger into `state`: aspect,
 value, and step, capped at roughly the last 20 entries. Jev needs it, or `goal_met` fires

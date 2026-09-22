@@ -70,10 +70,12 @@ const TRAIL_STEPS = 10
 
 // Extraction (#9). The thresholds are the line-by-line search cookbook's, the
 // same numbers behind `goal_met`: a present answer reads 0.98 and 0.97, an
-// absent one 0.14. A finding exists only above the present threshold, so the
-// absent band yields no entry by construction.
-const HAS_ANSWER = 0.7 // >= the chosen span is copied into the ledger
-const HAS_ANSWER_ABSENT = 0.35 // the cookbook's absent band; a firing goal_met on a page this low is a disagreement the trace records
+// absent one 0.14. The band between them is the model disagreeing with itself:
+// it named a span but `has_answer` did not clear the bar, and that span is
+// recorded as tentative rather than thrown away, so a round that read 0.68
+// leaves a finding instead of an empty ledger.
+const HAS_ANSWER = 0.7 // >= the chosen span is copied into the ledger, uncontested
+const HAS_ANSWER_ABSENT = 0.35 // < the cookbook's absent band; a named span this low is a disagreement the verdict records
 
 const fs = await import('node:fs')
 const HOME = process.env.HOME || ''
@@ -381,11 +383,14 @@ export function buildExtractionQuestions(spans) {
 }
 
 // The extraction verdict, pure so the self-check can assert byte-identity
-// against a fixture snapshot. A finding exists only when `has_answer` clears
-// the cookbook's present threshold AND the Choice names a span we offered —
-// validateChoice rejects every other id, so there is no path by which text
-// that appears nowhere on the page reaches the ledger. Code copies the chosen
-// span; nothing is written here.
+// against a fixture snapshot. The Choice is validated before any threshold is
+// read, so the model's span answer is never discarded unread. A finding exists
+// whenever the Choice names a span we offered, and validateChoice rejects every
+// other id, so there is no path by which text that appears nowhere on the page
+// reaches the ledger. Above the present threshold it is a finding; inside the
+// band below it, `tentative: true`, the model naming a span its own
+// `has_answer` did not back. Code copies the chosen span; nothing is written
+// here.
 export function readExtraction(response, spans, { id, step, url, aspect }) {
   const verdict = { appended: false }
 
@@ -396,7 +401,6 @@ export function readExtraction(response, spans, { id, step, url, aspect }) {
     return { ...verdict, reason: 'invalid_response', detail: error.message }
   }
   verdict.has_answer = hasAnswer
-  if (hasAnswer < HAS_ANSWER) return { ...verdict, reason: 'has_answer_low' }
 
   let pick
   try {
@@ -406,11 +410,13 @@ export function readExtraction(response, spans, { id, step, url, aspect }) {
   }
   verdict.span_choice = pick.choice
   verdict.confidence = pick.confidence
-  // A span picked from the absent band is a self-contradiction: mark it, so the
-  // trace line shows the disagreement with a firing `goal_met` without reading
-  // two numbers against each other.
-  if (hasAnswer < HAS_ANSWER_ABSENT) verdict.absent = true
   if (pick.choice === NO_ANSWER) return { ...verdict, reason: 'span_none' }
+
+  // Below the absent threshold the model contradicts itself: it named a span on
+  // a page it read as holding no answer at all. Marked on the verdict, so the
+  // trace line shows the disagreement with a firing `goal_met` without reading
+  // two numbers against each other, and nothing is appended.
+  if (hasAnswer < HAS_ANSWER_ABSENT) return { ...verdict, absent: true, reason: 'has_answer_absent' }
 
   const span = spans[Number(pick.choice.slice(1))]
   return {
@@ -424,6 +430,7 @@ export function readExtraction(response, spans, { id, step, url, aspect }) {
       value: span.value, // code copied: byte-identical to the snapshot, never generated
       evidence: span.evidence, // the exact line it was read from
       confidence: pick.confidence,
+      ...(hasAnswer < HAS_ANSWER ? { tentative: true } : {}),
     },
   }
 }
@@ -1443,11 +1450,23 @@ async function runSelfCheck() {
   assert.ok(answerPage.includes(collected.finding.value), 'byte-identical to the snapshot')
   assert.ok(answerPage.includes(collected.finding.evidence), 'evidence byte-identical too')
   assert.equal(collected.finding.confidence, 0.94, 'the pick carries its confidence')
+  assert.ok(!collected.finding.tentative, 'a cleared threshold is not tentative')
+  assert.ok(!collected.absent, 'a cleared threshold is not absent')
+
+  // Inside the band the model named a span its own has_answer did not back: the
+  // span is kept, marked tentative, so the round is not left with an empty
+  // ledger over 0.02 of probability.
+  const band = readExtraction(extractionResponse(0.68, `s${priceIndex}`), extractionSpans, { id: 'f1', step: 4, url: 'u', aspect: 'a' })
+  assert.equal(band.appended, true, 'the band appends rather than discarding the span')
+  assert.equal(band.finding.value, 'Price: $12.00', 'the band keeps the chosen span')
+  assert.equal(band.finding.tentative, true, 'and marks it tentative')
+  assert.ok(!band.absent, 'the band is not the absent band')
 
   // A page not containing the answer yields no entry, and has_answer reads low.
   const absent = readExtraction(extractionResponse(0.14, 's0'), extractionSpans, { id: 'f1', step: 4, url: 'u', aspect: 'a' })
-  assert.equal(absent.appended, false, 'no entry below the present threshold')
-  assert.equal(absent.reason, 'has_answer_low', 'the absent band says so')
+  assert.equal(absent.appended, false, 'no entry below the absent threshold')
+  assert.equal(absent.absent, true, 'the absent threshold sets absent')
+  assert.equal(absent.reason, 'has_answer_absent', 'and says why')
   // And the generation path does not exist: a Choice naming an id we never
   // offered is rejected wholesale, so no off-page text can be copied.
   const foreign = readExtraction(extractionResponse(0.94, 's999'), extractionSpans, { id: 'f1', step: 4, url: 'u', aspect: 'a' })
