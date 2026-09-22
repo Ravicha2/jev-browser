@@ -474,10 +474,11 @@ because step 8 removes commit-like controls upstream of the offer — and holds 
 as that filter's pattern set (`COMMIT_TEXT`, `BARE_RIGHT_ARROW`, `SUBMIT_INPUT`), which is a
 heuristic, not a proof. That is why removing the filter outright rather than **tagging** it
 (the design in #18: a commit-like pick returns as an authorization exit, never a click) would
-revisit this decision. Not built here: it needs its own measured arm, on the same 64 to 73
-candidate page and the same m1 goals. If the arm wins, this gate stops being the navigation
-checkpoint and stays what it measurably is, the trigger for the one retry before the posterior
-takes over.
+revisit this decision. Not built here: the arm is folded into #21 as a second run of its fixed
+goal set, control against arm, because #21 is already the instrument (per-goal `done`, ledger,
+tokens, run directories) and #30's own runs are its before reading for the gate half. If the
+arm wins, this gate stops being the navigation checkpoint and stays what it measurably is, the
+trigger for the one retry before the posterior takes over.
 
 ## Exit contract
 

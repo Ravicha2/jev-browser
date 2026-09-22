@@ -580,8 +580,12 @@ margin re-expression stays rejected with it.
   `.../runs/2026-09-22T11-51-12-551Z-...` step 4 retried at 0.45 and the re-ask came back at
   0.50, which cleared the bar and clicked. So the arm has to beat retry-then-click, not just
   beat retry.
-- **Where it would run.** The same 64 to 73 candidate page and the same m1 goals, per the
-  design pass. Not measured here.
+- **Where it runs.** Folded into #21 as a second arm rather than filed separately: the same
+  fixed goal set run twice, control against arm, with the same columns per goal. The design
+  pass's first suggestion (this 64 to 73 candidate page and the m1 goals) is superseded by
+  riding on #21's own action goals, which are chosen for verifiable terminal states; the #30
+  runs above are the arm's before reading for the gate half, since they are exactly the
+  sub-bar-pick regime on a long offer. Not measured here.
 
 If the arm wins, `NEXT_TARGET_CONFIDENCE` stops being the checkpoint for navigation and stays
 what it is measurably good at: the trigger for the one retry before the posterior takes over.
