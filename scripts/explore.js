@@ -585,6 +585,24 @@ async function onTheStartPage(startUrl) {
   }
 }
 
+// Whether this step spends an extraction ask on this page: `goal_met` fired, or
+// the page reads as one the goal asks us to read, and this fingerprint is not
+// already harvested.
+export function harvestDue({ decision, worthReading, fingerprint, harvested }) {
+  return (decision.kind === 'done' || worthReading > WORTH_READING) && !harvested.has(fingerprint)
+}
+
+// The harvest latch (#16): a page counts as harvested only once an extraction
+// actually appended a finding. Latching on the ask instead marked a page
+// harvested by a step that collected nothing, and the page was never asked
+// about again: HN round 3's steps 2 to 6 carry no extraction line at all for
+// this reason. A page that yielded nothing is retried on a later step; the
+// no-progress and repeat-page guards still bound the retries.
+export function latchHarvested(harvested, fingerprint, verdict) {
+  if (verdict?.appended) harvested.add(fingerprint)
+  return harvested
+}
+
 // One extraction (#9): spans from the visible snapshot, one ask, and on a clear
 // verdict the ledger append. Firing is the loop's decision — `goal_met` fired,
 // or the page reads as worth reading, and this fingerprint has not been
@@ -894,9 +912,9 @@ async function main() {
     // produce a finding. When it fires, or the page reads as one the goal asks
     // us to read, the extraction ask pairs the span Choice with `has_answer`,
     // and code copies the chosen span into the ledger. Once per page
-    // fingerprint: the digest, the caller-carried `harvested_fingerprints`, and
-    // the ledger's own duplicate guard keep a multi-item goal from re-collecting
-    // an item it already has.
+    // fingerprint that yielded one: the latch below, the digest, the
+    // caller-carried `harvested_fingerprints`, and the ledger's own duplicate
+    // guard keep a multi-item goal from re-collecting an item it already has.
     let worthReading = 0
     try {
       worthReading = readNoul(response, 'worth_reading')
@@ -904,8 +922,7 @@ async function main() {
       // A malformed worth_reading collects nothing; it is not this step's job
       // to fail the round over it.
     }
-    if ((decision.kind === 'done' || worthReading > WORTH_READING) && !harvested.has(observed.fingerprint)) {
-      harvested.add(observed.fingerprint)
+    if (harvestDue({ decision, worthReading, fingerprint: observed.fingerprint, harvested })) {
       stepExtraction = await harvest({
         observed,
         step: steps,
@@ -914,6 +931,7 @@ async function main() {
         ledgerPath: run.ledger,
         known: findings,
       })
+      latchHarvested(harvested, observed.fingerprint, stepExtraction)
     }
 
     const record = {
@@ -1462,6 +1480,32 @@ async function runSelfCheck() {
     { id: 'f1', step: 4, url: 'u', aspect: 'a' },
   )
   assert.equal(malformed.appended, false, 'a malformed has_answer collects nothing')
+
+  // The harvest latch (#16): the fingerprint is latched only by an extraction
+  // that appended. A page that collected nothing is asked about again; a page
+  // that collected is not, and neither case depends on the decision that
+  // triggered the ask.
+  const decideDone = { kind: 'done' }
+  const latched = new Set()
+  assert.equal(harvestDue({ decision: decideDone, worthReading: 0, fingerprint: 'fp', harvested: latched }), true, 'a done step harvests a fresh page')
+  assert.equal(
+    harvestDue({ decision: { kind: 'click' }, worthReading: 0.6, fingerprint: 'fp', harvested: latched }),
+    true,
+    'so does a page the goal asks us to read',
+  )
+  assert.equal(
+    harvestDue({ decision: { kind: 'click' }, worthReading: 0.3, fingerprint: 'fp', harvested: latched }),
+    false,
+    'a page the goal does not ask us to read is left alone',
+  )
+  latchHarvested(latched, 'fp', { asked: true, appended: false, reason: 'has_answer_absent' })
+  assert.equal(latched.size, 0, 'an extraction that appended nothing does not latch')
+  assert.equal(harvestDue({ decision: decideDone, worthReading: 0, fingerprint: 'fp', harvested: latched }), true, 'so the page is asked about again')
+  latchHarvested(latched, 'fp', { asked: false, reason: 'no_spans' })
+  assert.equal(latched.size, 0, 'a page with no spans to offer does not latch either')
+  latchHarvested(latched, 'fp', { asked: true, appended: true, finding: { id: 'f1' } })
+  assert.equal(latched.has('fp'), true, 'an append latches the fingerprint')
+  assert.equal(harvestDue({ decision: decideDone, worthReading: 0.9, fingerprint: 'fp', harvested: latched }), false, 'and no later step re-asks it')
 
   // The extraction request has no candidates to shave, and still fits.
   const extractionQuestions = buildExtractionQuestions(extractionSpans)

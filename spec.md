@@ -413,7 +413,9 @@ The loop writes all three (#9). The exit object names the run directory, the
 ledger, and the trace; the caller copies `run_dir` into `job.json`, which is how
 round N+1 appends to the same ledger instead of starting a new one. Extraction
 fires when `goal_met` crosses its threshold or `worth_reading` clears 0.5 —
-once per page fingerprint, carried across rounds in `harvested_fingerprints`,
+once per page fingerprint that yielded a finding (#16: the fingerprint is
+latched on the append, not on the ask, so a page that collected nothing is
+asked about again), carried across rounds in `harvested_fingerprints`,
 which the caller records exactly like `visited_fingerprints`. Spans come from
 the **visible** tree only: a span cut from the full tree would be off-screen
 text Jev was never shown.
