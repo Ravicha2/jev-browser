@@ -1,10 +1,18 @@
 // jev-browser explore loop (issue #3, reachability fixed in #10; spec.md "The
 // step loop". Ledger, digest, and trace are #9).
 //
-// Exploratory collection. Snapshot, prune, ask Jev which candidate leads toward
+// Explore loop. Snapshot, prune, ask Jev which candidate leads toward
 // the goal, branch in code, click what it named, repeat to the step budget. Jev
 // never ranks DOM refs for their own sake; it picks which *content* matters, and
 // code turns that pick into a click.
+//
+// A commit-like control is the one exception (#18), and it is an authorization
+// rather than a click: commit-like candidates stay in the offer, marked, so the
+// model may name one — but a marked pick comes back to the caller as a
+// `needs_input` exit carrying its label, ref and confidence, and the control is
+// clicked only when the caller supplies that pick on the next round. The
+// denylist only decides what is marked; the authorization is what stands between
+// a pick and a click (`offerRow` and `authorizedPick` below).
 //
 // #9 makes the loop gather something. When `goal_met` fires, or a page reads as
 // one the goal asks us to read, a second ask pairs a selection Choice over
@@ -40,7 +48,6 @@ const GOAL_MET = 0.8 // >= exits done
 const NEXT_TARGET_CONFIDENCE = 0.5 // < re-asks once over the same list, then escalates
 const CREDENTIAL_NOUL = 0.7 // > hands off to the user
 const CANNOT_CHOOSE_NOUL = 0.6 // > retries once, then escalates
-const ONLY_COMMIT_NOUL = 0.5 // > escalates
 const LAYOUT_NOUL = 0.6 // spec names no number for this one; mirrors cannot_choose.
 const WORTH_READING = 0.5 // > and a page the goal asks us to read gets scrolled before escalating
 const PAGE_SCROLL_LIMIT = 3 // viewports the loop will read down one page; monsters are served by their TOC anchors
@@ -132,9 +139,67 @@ export function offerTrace(entry) {
 // object itself keeps is the bare label: the trail, the spend key and
 // `resolveTarget` all outlive this step, and a number that moves when a spent
 // row drops out would stop matching them.
+//
+// The `commit` mark is #18's. A commit-like control keeps its seat (prune.js tags
+// it rather than removing it) and the row says so, because the model has to be
+// able to name a control it must not click: a marked pick is an authorization
+// exit, and only the caller's answer on the next round turns it into a click.
 export function offerRow(candidate, index) {
-  const state = candidate.state ? ` (${candidate.state})` : ''
-  return { ref: candidate.ref, label: `${index + 1}. ${candidate.label}${state}`, count: candidate.count }
+  // The marks a row can carry: its state (#30), and since #18 that it is a
+  // commit-like control — which the model may name and code will not click until
+  // the caller authorizes it (#18).
+  const marks = [
+    candidate.state,
+    candidate.commitLike ? 'commit' : null,
+  ].filter(Boolean)
+  const suffix = marks.length ? ` (${marks.join(', ')})` : ''
+  return { ref: candidate.ref, label: `${index + 1}. ${candidate.label}${suffix}`, count: candidate.count }
+}
+
+// The slug a commit-like pick is asked for under (#18), folded exactly as
+// fill-form.js folds a field label (#7) — one rule names both kinds of ask. The
+// label is page content, so the ask is code's, never the model's.
+export function fieldSlug(label) {
+  const slug = String(label ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  return slug || 'field'
+}
+
+// The ping-pong key of an authorization ask (#18), the same `<fingerprint>:<slug>`
+// shape fill-form.js uses for a field (#7). The caller appends it to
+// `visited_fingerprints` when it answers, so a round that is asked to authorize
+// the same control on the same page twice escalates instead of asking forever.
+export function visitedKey(fingerprint, slug) {
+  return `${fingerprint}:${slug}`
+}
+
+// The authorization channel (#18). A non-empty supplied value under a commit-like
+// candidate's own slug is the caller authorizing that pick: the judgment was
+// Claude Code's when it answered the exit, so code clicks it without an ask —
+// exactly as the form loop fills a supplied field without one. Returned with the
+// candidate, not a ref, so the click resolves through the same label path the
+// Jev-driven click uses and lands on the control the caller named. An empty
+// string is not an authorization (the form loop's "settle as empty" convention
+// would otherwise click a commit); a non-commit candidate is not an
+// authorization either, whatever it is keyed as.
+//
+// `alreadyAuthorized` holds the slugs this round has clicked: one authorization
+// is one click, so a control that survives its own click is not clicked again by
+// the same answer. The next one the caller supplies is still honored.
+export function authorizedPick(candidates, suppliedValues, alreadyAuthorized = new Set()) {
+  if (!suppliedValues || typeof suppliedValues !== 'object' || Array.isArray(suppliedValues)) return null
+  for (const candidate of candidates) {
+    if (!candidate.commitLike) continue
+    const slug = fieldSlug(candidate.label)
+    if (alreadyAuthorized.has(slug)) continue
+    if (!Object.prototype.hasOwnProperty.call(suppliedValues, slug)) continue
+    const value = suppliedValues[slug]
+    if (typeof value !== 'string' || value.length === 0) continue
+    return { candidate, slug, value }
+  }
+  return null
 }
 
 // Spend a path: the url when there is one, the label only as the fallback for
@@ -185,15 +250,15 @@ export function matchesStartUrl(observedUrl, startUrl) {
 
 // The guards that need no decision. Returns an exit object to stop, or null to
 // keep going. The least-bad candidate is never picked: an empty list ends the
-// round, and so does a list step 7 emptied.
+// round. A list of nothing but commit-like controls is no longer an exit (#18):
+// those candidates are offered, so an empty list means the page offered nothing
+// at all, and the commit case has its own exit, on the pick.
 export function preflight({
-  step, budget, candidates, commitOnly, fingerprint, noProgress, visited, escalated,
+  step, budget, candidates, fingerprint, noProgress, visited, escalated,
 }) {
   if (step > budget) return { reason: 'step_budget' }
   if (noProgress >= NO_PROGRESS_LIMIT) return { reason: 'no_progress' }
-  if (candidates.length === 0) {
-    return { reason: commitOnly ? 'only_commit_remains' : 'cannot_choose' }
-  }
+  if (candidates.length === 0) return { reason: 'cannot_choose' }
   // Repeat page: this fingerprint has already been decided on in this run.
   if (visited.has(fingerprint)) return { reason: 'repeat_page' }
   // Ping-pong: a previous round escalated here and the caller answered. Refusing
@@ -342,9 +407,6 @@ export function readDecision({ response, candidates, retried }) {
   if (readNoul(response, 'layout_unfamiliar') > LAYOUT_NOUL) {
     return { kind: 'escalate', reason: 'layout_unfamiliar' }
   }
-  if (readNoul(response, 'only_commit_remains') > ONLY_COMMIT_NOUL) {
-    return { kind: 'escalate', reason: 'only_commit_remains' }
-  }
   if (readNoul(response, 'cannot_choose') > CANNOT_CHOOSE_NOUL) return retryOr('cannot_choose')
 
   const offered = [...candidates.map((candidate) => candidate.ref), NO_ANSWER]
@@ -366,6 +428,21 @@ export function readDecision({ response, candidates, retried }) {
   if (confidence < NEXT_TARGET_CONFIDENCE) return retryOr('low_confidence')
 
   const index = candidates.findIndex((candidate) => candidate.ref === choice)
+  // A marked pick is a decision, not an action (#18). It comes back to the
+  // caller for authorization with what the exit has to carry — the label, the
+  // ref and the confidence the model gave it — and code clicks it only when the
+  // caller supplies it on the next round. Nothing about the control is hidden
+  // from the decision: the model ranks the whole offer, the tag only decides
+  // what happens to the answer.
+  if (candidates[index].commitLike) {
+    return {
+      kind: 'authorize',
+      index,
+      ref: candidates[index].ref,
+      label: candidates[index].label,
+      confidence,
+    }
+  }
   return { kind: 'click', index, label: candidates[index].label }
 }
 
@@ -403,7 +480,7 @@ export function buildQuestions(candidates) {
   return {
     next_target: {
       type: 'choice',
-      instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list, and a row marked (current), (selected) or (expanded) is already open. Choose `none` if none does.',
+      instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list. A row marked (current), (selected) or (expanded) is already open; a row marked (commit) submits, sends, pays or deletes, so naming one asks for confirmation instead of clicking it. Choose `none` if none does.',
       criteria,
     },
     goal_met: {
@@ -428,11 +505,6 @@ export function buildQuestions(candidates) {
       type: 'noul',
       instructions: 'Is there no candidate that clearly advances `goal`?',
       criteria: { true: 'None of the candidates advances the goal', false: 'At least one does' },
-    },
-    only_commit_remains: {
-      type: 'noul',
-      instructions: 'Are the only remaining actions ones that submit, send, publish, pay, or delete?',
-      criteria: { true: 'Only such actions remain', false: 'Other actions remain, or none at all' },
     },
     layout_unfamiliar: {
       type: 'noul',
@@ -583,7 +655,7 @@ async function observe() {
   const info = await pageInfo()
   if (info.dialog) throw new Error('a native browser dialog is open; the page is blocked')
 
-  const { candidates, commitCount, offscreenCount } = pruneDetail(page, {
+  const { candidates, offscreenCount } = pruneDetail(page, {
     visibleRefs: [...refsIn(visible)],
     currentUrl: info.url,
   })
@@ -609,7 +681,6 @@ async function observe() {
     offscreenCount,
     pageText: visible,
     candidates,
-    commitOnly: candidates.length === 0 && commitCount > 0,
     fingerprint: await pageFingerprint(info.url, candidates),
   }
 }
@@ -861,6 +932,10 @@ async function main() {
     ? spentUrls.has(candidate.url)
     : spentLabels.has(candidate.label))
   const anySpent = () => spentUrls.size > 0 || spentLabels.size > 0
+  // Commit-like picks this round has already clicked, by slug (#18). One
+  // authorization is one click; a second answer from the caller is a second
+  // entry, so a route with two commits the caller authorized clicks both.
+  const alreadyAuthorized = new Set()
 
   // Per-step trace state (#9): the answers and the extraction verdict of this
   // step's ask, written into the step's trace line when its decision is
@@ -970,7 +1045,6 @@ async function main() {
       step: steps,
       budget,
       candidates: observed.candidates,
-      commitOnly: observed.commitOnly,
       fingerprint: observed.fingerprint,
       noProgress: progress.noProgress,
       visited,
@@ -1035,6 +1109,81 @@ async function main() {
     const candidates = anySpent()
       ? observed.candidates.filter((candidate) => !spent(candidate))
       : observed.candidates
+
+    // The authorization channel (#18). A commit-like pick the caller supplied on
+    // this round is clicked before any ask, exactly as the form loop fills a
+    // supplied field without one (#7): the judgment was Claude Code's when it
+    // answered the exit, and re-asking Jev to approve its own answer would hand
+    // the round back to a model that would pick the same control again. The
+    // click goes through the same two guarantees as every other click — the
+    // candidate is matched by label against a snapshot taken immediately before
+    // acting, so the page moving under us is not clicked at all — and it is the
+    // one control the caller named: nothing else is resolved, and the round
+    // continues from wherever that lands.
+    const authorized = authorizedPick(candidates, job.supplied_values, alreadyAuthorized)
+    if (authorized) {
+      // Consumed before the click, for the reason the Jev-driven decision is
+      // consumed before its own (#10): one authorization is one click. A control
+      // that survives its own click is still offered, and without this the same
+      // answer would click it again on every step to the budget.
+      alreadyAuthorized.add(authorized.slug)
+      const fresh = await observe()
+      const target = resolveTarget(authorized.candidate, observed, fresh, null)
+      if (!target) {
+        return exitObject({
+          status: 'escalate',
+          reason: 'stale_page',
+          step: steps,
+          state: fresh,
+          extra: {
+            goal: job.goal,
+            detail: `the authorized "${authorized.candidate.label}" control is not in the fresh snapshot of ${fresh.url}`,
+            trail: history.slice(-TRAIL_STEPS),
+            ...(ledgerExtras()),
+          },
+        })
+      }
+      try {
+        await reveal(target)
+      } catch {
+        // The click itself does not need the element on screen (reveal's own
+        // contract), so a failed reveal falls through to the click.
+      }
+      let clickError = null
+      try {
+        await click(target, { label: `step ${steps}: authorized ${authorized.candidate.label}`.slice(0, 64) })
+      } catch (error) {
+        clickError = error.message
+      }
+      await wait(SETTLE_SECONDS)
+      const actedSy = await js('window.scrollY').catch(() => null)
+      // Recorded here rather than through `recorded()` below: that helper
+      // carries the ask this step never made (its answers, its latency, its
+      // offer), and a step with no ask has none of them — the stop lines above
+      // are written the same way.
+      const entry = {
+        step: steps,
+        url: observed.url,
+        fingerprint: observed.fingerprint,
+        sy: observed.sy,
+        candidates: candidates.length,
+        decision: `click ${target}`,
+        label: authorized.candidate.label,
+        authorized: true,
+        ...(authorized.candidate.url ? { target_url: authorized.candidate.url } : {}),
+        ...(clickError ? { error: clickError } : {}),
+        latency_ms: null,
+        usage: null,
+      }
+      history.push(entry)
+      writeTrace(entry)
+      progress = actedBaseline(progress, { fingerprint: fresh.fingerprint, sy: actedSy })
+      lastAction = { label: authorized.candidate.label, target_url: authorized.candidate.url ?? null }
+      retried = false
+      spentUrls.clear()
+      spentLabels.clear()
+      continue
+    }
 
     // Every candidate the dead action left is now spent itself (#27): the loop
     // has run out of things to try, and it acted and nothing moved, which is
@@ -1177,6 +1326,50 @@ async function main() {
         extra.handoff = handoff
       }
       return exitObject({ status: 'escalate', reason: decision.reason, step: steps, state: observed, extra })
+    }
+
+    // The authorization ask (#18). Naming a commit-like control is not clicking
+    // it: the pick goes back to the caller with its label, ref and confidence,
+    // and the caller either supplies it on the next round — which the direct
+    // channel at the top of the loop turns into that one click — or answers
+    // nothing, and the round ends here having clicked nothing. The guard is the
+    // needs_input guard (#7): the caller records `<page_fingerprint>:<field>` in
+    // `visited_fingerprints` when it answers, so being asked to authorize the
+    // same control on the same page again is a ping-pong, not a second question.
+    if (decision.kind === 'authorize') {
+      const slug = fieldSlug(decision.label)
+      const key = visitedKey(observed.fingerprint, slug)
+      const pick = { ref: decision.ref, label: decision.label, confidence: decision.confidence }
+      if (visited.has(key)) {
+        return exitObject({
+          status: 'escalate',
+          reason: 'ping_pong',
+          step: steps,
+          state: observed,
+          extra: {
+            goal: job.goal,
+            pick,
+            detail: `${slug} was already authorized on this page and the answer did not unblock it`,
+            trail: recorded('escalate:ping_pong'),
+            ...(ledgerExtras()),
+          },
+        })
+      }
+      visited.add(key)
+      return exitObject({
+        status: 'needs_input',
+        step: steps,
+        state: observed,
+        extra: {
+          field: slug,
+          wants: `authorization to click the "${decision.label}" control`,
+          pick,
+          goal: job.goal,
+          task_space_id: task.id,
+          trail: recorded(`authorize:${decision.label}`),
+          ...(ledgerExtras()),
+        },
+      })
     }
 
     // The read-scroll, ahead of both the retry and the click. `lastAction`
@@ -1360,7 +1553,7 @@ function deadClicksStablePage(labels) {
     if (progress.noProgress >= 1) spendPath(pathToSpend(lastAction), spentUrls, spentLabels)
     if (deadEnd({ lastAction, candidates, spent })) return { reason: 'no_progress', step, picked }
     const stop = preflight({
-      step, budget: 12, candidates, commitOnly: false,
+      step, budget: 12, candidates,
       fingerprint: 'stable', noProgress: progress.noProgress,
       visited: new Set(), escalated: new Set(),
     })
@@ -1377,7 +1570,7 @@ async function runSelfCheck() {
   const assert = (await import('node:assert/strict')).default
   const fp = 'abc12345'
   const base = {
-    step: 1, budget: 12, candidates: [{ ref: '@1', label: 'Read more' }], commitOnly: false,
+    step: 1, budget: 12, candidates: [{ ref: '@1', label: 'Read more' }],
     fingerprint: fp, noProgress: 0, visited: new Set(), escalated: new Set(),
   }
   const reason = (patch) => preflight({ ...base, ...patch })?.reason ?? null
@@ -1388,8 +1581,23 @@ async function runSelfCheck() {
   assert.equal(reason({ noProgress: 2 }), null, 'two is not blocked yet')
   assert.equal(reason({ visited: new Set([fp]) }), 'repeat_page', 'repeat-page guard')
   assert.equal(reason({ escalated: new Set([fp]) }), 'ping_pong', 'ping-pong guard')
-  assert.equal(reason({ candidates: [], commitOnly: true }), 'only_commit_remains', 'commit-only list')
-  assert.equal(reason({ candidates: [], commitOnly: false }), 'cannot_choose', 'empty list')
+  assert.equal(reason({ candidates: [] }), 'cannot_choose', 'empty list')
+  // #18 removed the commit-only exit: a page whose whole offer is commit-like is
+  // a page the model can pick from, and the pick has its own exit. Nothing here
+  // is left to stop on, so the list is offered as it is.
+  assert.equal(
+    reason({ candidates: [{ ref: '@1', label: 'Buy now', commitLike: true }] }),
+    null,
+    'a commit-only offer is offered, not stopped on',
+  )
+  // The composite authorization key (#18) shares the set with bare fingerprints
+  // and never collides with one, so recording an answered ask cannot trip the
+  // repeat-page guard.
+  assert.equal(
+    reason({ visited: new Set([visitedKey(fp, 'buy_now')]) }),
+    null,
+    'an authorization key is not a fingerprint',
+  )
   assert.equal(reason({}), null, 'a healthy step proceeds')
 
   // No progress: counts consecutive actions with no observable change — the
@@ -1609,7 +1817,7 @@ async function runSelfCheck() {
   const noulAnswers = (overrides = {}) => Object.fromEntries(
     Object.entries({
       needs_credential: 0.01, goal_met: 0.2, layout_unfamiliar: 0.05,
-      only_commit_remains: 0.05, cannot_choose: 0.02, worth_reading: 0.9, ...overrides,
+      cannot_choose: 0.02, worth_reading: 0.9, ...overrides,
     }).map(([id, value]) => [id, { type: 'noul', noul: value }]),
   )
   // `choice`, `confidence`, `probabilities` are the three fields of a real answer.
@@ -1642,9 +1850,6 @@ async function runSelfCheck() {
   assert.equal(decided(response(sure, { goal_met: 0.79 })).kind, 'click', 'below the threshold does not exit')
   assert.equal(
     decided(response(sure, { needs_credential: 0.71 })).reason, 'credentials_required', 'a credential page',
-  )
-  assert.equal(
-    decided(response(sure, { only_commit_remains: 0.6 })).reason, 'only_commit_remains', 'a commit page',
   )
   assert.equal(
     decided(response(sure, { layout_unfamiliar: 0.7 })).reason, 'layout_unfamiliar', 'a canvas page',
@@ -1685,10 +1890,72 @@ async function runSelfCheck() {
   assert.throws(() => readNoul({ answers: { goal_met: { type: 'noul', noul: 'yes' } } }, 'goal_met'))
   assert.throws(() => readNoul({ answers: {} }, 'goal_met'))
 
-  // The trust boundary travels: no commit-like label can reach the questions.
+  // The trust boundary, as #18 moved it: a commit-like control reaches the
+  // questions (marked) and the pick is not clicked. The offer row carries the
+  // mark, the decision comes back as an authorization, and the click waits for
+  // the caller's answer — so the property to check is "no commit-like pick is
+  // clicked", not "no commit-like label is offered".
   const asked = buildQuestions([{ ref: '@2', label: 'Help' }].map(offerRow))
   assert.ok(asked.next_target.criteria.none && !asked.next_target.criteria['@1'], 'criteria are the offered ids')
   assert.equal(asked.next_target.criteria['@2'], '1. Help')
+
+  const commitRow = offerRow({ ref: '@3', label: 'Buy now', count: 1, commitLike: true }, 2)
+  assert.equal(commitRow.label, '3. Buy now (commit)', 'a commit-like row is offered marked')
+  assert.equal(
+    offerRow({ ref: '@4', label: 'Next', count: 1, commitLike: true, state: 'current' }, 3).label,
+    '4. Next (current, commit)',
+    'the state and the mark share the row',
+  )
+  const commitOffer = [{ ref: '@3', label: 'Buy now', count: 1, commitLike: true }]
+  const namingIt = decided(
+    response({ choice: '@3', confidence: 0.9, probabilities: { '@3': 0.9, none: 0.1 } }),
+    { offered: commitOffer },
+  )
+  assert.deepEqual(
+    namingIt,
+    { kind: 'authorize', index: 0, ref: '@3', label: 'Buy now', confidence: 0.9 },
+    'naming a commit-like control is an authorization, not a click',
+  )
+  assert.notEqual(namingIt.kind, 'click', 'and nothing executes on it')
+  // The authorization channel: only the caller's non-empty answer, only under
+  // the control's own slug, and only ever the control it names.
+  assert.equal(authorizedPick(commitOffer, {}), null, 'no supplied value, no authorization')
+  assert.equal(authorizedPick(commitOffer, { buy_now: '' }), null, 'an empty answer is not an authorization')
+  assert.equal(authorizedPick(commitOffer, { buy_now: 7 }), null, 'a non-string is not an authorization')
+  assert.equal(authorizedPick(commitOffer, { help: 'yes' }), null, 'a slug that names no control authorizes nothing')
+  assert.equal(
+    authorizedPick([{ ref: '@2', label: 'Help' }], { help: 'yes' }),
+    null,
+    'an unmarked candidate is never authorized',
+  )
+  assert.equal(authorizedPick(commitOffer, { buy_now: 'yes' }).candidate.ref, '@3', 'the answer authorizes its own control')
+  assert.equal(
+    authorizedPick(commitOffer, { buy_now: 'yes' }, new Set(['buy_now'])),
+    null,
+    'one authorization is one click',
+  )
+
+  // The round trip, in the functions the loop drives it through: the pick rides
+  // out with a slug and a ping-pong key, and the caller's answer on the next
+  // round resolves to that one control — by label, off the fresh snapshot,
+  // exactly as the act path does it.
+  const authorized = authorizedPick(commitOffer, { buy_now: 'yes' })
+  assert.equal(fieldSlug(authorized.candidate.label), 'buy_now', 'the ask is keyed by the label, folded')
+  assert.equal(
+    visitedKey(fp, 'buy_now'), `${fp}:buy_now`,
+    'the caller records the page and the control, as a field ask does (#7)',
+  )
+  const samePage = { fingerprint: fp, candidates: commitOffer }
+  assert.equal(
+    resolveTarget(authorized.candidate, samePage, samePage),
+    '@3',
+    'the next round clicks the control the caller authorized',
+  )
+  assert.equal(
+    resolveTarget(authorized.candidate, samePage, { fingerprint: fp, candidates: [{ ref: '@9', label: 'Something else' }] }),
+    null,
+    'and clicks nothing at all if that control left the page',
+  )
 
   // The offer row (#30): the position, then the label, then the state. A flat
   // list of labels cannot answer "the first job listing" — measured on the
