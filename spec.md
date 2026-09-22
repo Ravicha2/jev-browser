@@ -2,7 +2,8 @@
 
 A deterministic browser loop where **Jev supplies the judgments** and **code owns the
 control flow**. Claude Code hands it a goal; it explores, reads, and reports back
-structured findings. It can fill forms. It never submits.
+structured findings. It can fill forms. It never submits on its own: a commit-like control
+comes back to the caller for authorization before it is clicked (#18).
 
 ## Why this shape
 
@@ -157,8 +158,13 @@ to Claude Code." That is a question about our system, it is exactly the kind of 
 the model handles poorly, and it puts a threshold inside the model where it cannot be tuned.
 Ask about the page, then branch on the number ourselves.
 
-**4. Submitting is unreachable, not discouraged.** Not enforced by instruction. Enforced by
-removing commit-like controls from the candidate list before Jev sees it.
+**4. Submitting is authorized, not unreachable (#18).** Not enforced by instruction either.
+Commit-like controls stay in the candidate list, marked, so Jev may name one — and naming one
+is not clicking one: the pick comes back to the caller as a `needs_input` exit carrying its
+label, ref and confidence, and the control is clicked only when the caller supplies that pick
+on the next round. Before #18 the filter removed them, which made the end of a route
+unreachable rather than authorized. See "Commit-like controls (#18)" under Candidate pruning
+for what the denylist does and does not cover.
 
 **5. One request per step, several speculative questions in it.** Output tokens are free and
 questions run in parallel, so ask for branches we may not take and read only the one we need.
@@ -177,17 +183,19 @@ One heredoc per round. Loop inside it, print one JSON object, exit.
 
 ```
 1. snapshotText()                                  observe
-2. prune to candidates                             code, plus the no-commit filter
-3. fetch(/v1/systemone) with 4 to 6 questions       Jev judges, ~100ms
-4. branch on the answers                            code
+2. prune to candidates                             code, plus the commit tag
+3. a commit-like pick the caller supplied          code, before any ask: click
+   (the authorization round trip, #18)             that control and nothing else
+4. fetch(/v1/systemone) with 4 to 6 questions       Jev judges, ~100ms
+5. branch on the answers                            code
      - credential needed        -> handOffTaskSpace, exit escalate
-     - only commit remains      -> exit escalate
+     - commit-like pick         -> exit needs_input: authorize this control (#18)
      - goal met                 -> exit done
      - no candidate advances    -> scroll one viewport if the page is worth
                                    reading and unread below; otherwise retry
                                    once, then exit escalate
      - otherwise                -> reveal the target if off-screen, click it, continue
-5. guard: step budget, repeat page, ping-pong       code
+6. guard: step budget, repeat page, ping-pong       code
 ```
 
 Suggested limits: 12 steps for exploratory collection, 20 for form filling. Page load is
@@ -270,7 +278,8 @@ the state query marks and it still takes the pick in the marked arm; and a page 
 **re-renders while it loads** resets the fingerprint every step, so nothing accumulates and
 only the spend bounds the repetition. Both are `no_progress`-shape failures, so `no_progress`,
 `NO_PROGRESS_LIMIT`, `repeat_page`/`REVISIT_LIMIT`, `ping_pong`, `step_budget`,
-`only_commit_remains`, `start_url_mismatch` and `stale_page` all keep their live triggers.
+`start_url_mismatch` and `stale_page` all keep their live triggers. (`only_commit_remains`
+is the one exit that did not: #18 removed it, as recorded under Candidate pruning.)
 Nothing in the guard set becomes dead code; the state mark makes one guard fire earlier, not
 less often.
 
@@ -311,14 +320,47 @@ control.
    options; we stay well under because accuracy degrades as unrelated state grows. The
    reordering is scroll-stable (urls do not move with the viewport) and fingerprint-invisible
    (the fingerprint hashes sorted label|count pairs, not order).
-8. **Remove commit-like controls.** Any node whose text or `aria-label` matches
+8. **Tag commit-like controls.** Any node whose text or `aria-label` matches
    submit, send, post, publish, pay, buy, checkout, confirm, delete, remove, cancel order,
    unsubscribe, or a bare right-arrow, and any `input[type=submit]`.
 
-Step 7 is a trust boundary, so it is a code rule and not a question. A denylist will miss
-things (icon buttons, JS-driven buttons with a friendly `aria-label`). That is why the policy
-degrades safely: when the pruned list is empty or *only* commit-like candidates remain, the
-loop stops and escalates rather than guessing.
+Step 8 is a trust boundary, so it is a code rule and not a question. Until #18 it *removed*
+those controls, which made submitting unreachable and also unreachable when it was the goal:
+a route whose end is a commit could never be walked. It now tags them instead, and the tag is
+what the loop acts on — the candidate keeps its seat, the offer row says `(commit)`, and the
+pick is returned for the caller's authorization instead of being clicked. The denylist's
+weakness stops being a safety claim and becomes a labelling claim: what it misses is offered
+unmarked, and what it catches is offered marked and gated on the authorization.
+
+### Commit-like controls (#18)
+
+- **What the caller sees.** A commit-like pick exits `needs_input` with `field` (the label
+  folded to a slug), `wants` ("authorization to click the `<label>` control"), and `pick`
+  (`ref`, `label`, `confidence`). Nothing was clicked.
+- **What the caller does.** Supply the pick under that slug in `supplied_values` (any
+  non-empty string: the value names the authorization, the slug names the control), append
+  `<page_fingerprint>:<field>` to `visited_fingerprints`, and re-invoke with the same
+  `task_space_id` and `start_url` set to the exit's `url` — the control lives on the page the
+  exit stopped on, and the start-url check would otherwise re-aim the tab away from it.
+- **What the resumed round does.** The authorization channel runs before any ask: code
+  matches the supplied slug to a commit-like candidate in this round's observation, resolves
+  it by label against a snapshot taken immediately before acting (the same freshness rule
+  every other click gets), and clicks that one control. Exactly one click per authorization:
+  a control that survives its own click is not clicked again by the same answer.
+- **The repeat guard.** The recorded `<page_fingerprint>:<field>` makes a second authorization
+  ask for the same control on the same page a `ping_pong` escalate (#7's guard, the same
+  key shape). The composite key never collides with the bare fingerprints `repeat_page` uses.
+- **The denylist blind spot is an accepted risk, not a fixed one.** Measured against real
+  labels, `Subscribe`, `Add to cart`, `Like this video`, `Save`, `Next`, `Continue` and
+  `Sign in` all pass `isCommitLike` (`prune.js`), and `Continue` is the button that advances a
+  checkout from cart to payment. An unlabelled commit control stays offered unmarked and,
+  once picked, is clicked without an authorization. The safety claim rests on the caller's
+  authorization step and on the route being enumerated, not on this filter.
+- **`only_commit_remains` is gone (#18's decision).** It was the exit for "the filter emptied
+  the list": it fired on `candidates.length === 0` (the preflight reason) and on the model's
+  companion Noul at > 0.5, and the Noul fired before the pick was read — which would have
+  pre-empted the authorization on exactly the pages this decision is about. With the tag, an
+  empty list is simply `cannot_choose` and the commit case has its own exit, on the pick.
 
 ### The offer's shape (#30)
 
@@ -416,7 +458,6 @@ questions = {
   // Escalation conditions, one per reason. Independent Nouls, composed in code.
   needs_credential:    { type: 'noul', instructions: 'Does `current_page` require a login or credential to proceed?' },
   cannot_choose:       { type: 'noul', instructions: 'Is there no candidate that clearly advances `goal`?' },
-  only_commit_remains:{ type: 'noul', instructions: 'Are the only remaining actions ones that submit, send, publish, pay, or delete?' },
   layout_unfamiliar:   { type: 'noul', instructions: 'Is this an interface that `candidates` represents poorly, such as a canvas or virtualized editor?' },
 }
 ```
@@ -455,8 +496,10 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
 | `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
 | `worth_reading.noul` | > 0.5 | with a retry pending, or a granted revisit (#11): scroll one viewport before spending it, max 3 per page |
-| `only_commit_remains.noul` | > 0.5 | exit escalate |
 | any field `choice` confidence | < 0.5 | leave the field, report it in `needs_input` |
+
+There is no commit threshold any more: tagging made it a mark on a candidate rather than a
+number to compare, and the pick's own exit carries the decision (#18).
 
 A malformed `choice` answer gets the same one retry before escalating as `invalid_response`,
 so a self-disagreeing answer costs a re-ask rather than a round.
@@ -470,11 +513,11 @@ argument: an escalate ends the round (session 2: 326,070 input tokens over nine 
 about 36k each, four dead before a guard mattered), while a wrong non-commit click costs one or
 two steps of a 6 to 12 step budget and is already policed by the dead-action spend, revisit
 continue and `no_progress`. The premise is that every offered click is reversible, which holds
-because step 8 removes commit-like controls upstream of the offer — and holds only as strongly
-as that filter's pattern set (`COMMIT_TEXT`, `BARE_RIGHT_ARROW`, `SUBMIT_INPUT`), which is a
-heuristic, not a proof. That is why removing the filter outright rather than **tagging** it
-(the design in #18: a commit-like pick returns as an authorization exit, never a click) would
-revisit this decision. Not built here: the arm is folded into #21 as a second run of its fixed
+because step 8 keeps commit-like controls out of the clicked set: tagged rather than removed
+since #18, offered and marked, and clicked only after the caller authorizes that pick. It is
+still only as strong as the tag's pattern set (`COMMIT_TEXT`, `BARE_RIGHT_ARROW`,
+`SUBMIT_INPUT`) plus the authorization that covers what the patterns miss — a heuristic for
+the labelling, a caller's answer for the click. Not built here: the arm is folded into #21 as a second run of its fixed
 goal set, control against arm, because #21 is already the instrument (per-goal `done`, ledger,
 tokens, run directories) and #30's own runs are its before reading for the gate half. If the
 arm wins, this gate stops being the navigation checkpoint and stays what it measurably is, the
@@ -489,6 +532,8 @@ anyway.
 ```json
 { "status": "done",        "goal": "...", "findings": [ ... ], "steps": 7, "url": "..." }
 { "status": "needs_input", "field": "vat_number", "wants": "a VAT registration number", "page_fingerprint": "..." }
+{ "status": "needs_input", "field": "buy_now", "wants": "authorization to click the \"Buy now\" control",
+  "pick": { "ref": "@21", "label": "Buy now", "confidence": 0.82 }, "page_fingerprint": "...", "url": "..." }
 { "status": "escalate",    "reason": "credentials_required", "step": 9, "page_fingerprint": "...", "partial_findings": [ ... ] }
 ```
 
@@ -503,13 +548,18 @@ generate text: the label is page content code copied, exactly like a finding's e
 span (#7). One field is named per round; a form with several unknown values converges
 over rounds.
 
+The same exit carries the **commit authorization** (#18), and it is the same protocol: `field`
+is the commit-like control's label folded to a slug, and `pick` carries the `ref`, `label` and
+`confidence` the model gave it, so the caller has the whole basis for the decision in the exit
+object. Nothing was clicked. The caller's answer is a direct click, not a fill. Full round
+trip under Candidate pruning, "Commit-like controls (#18)".
+
 The `reason` is the vocabulary Claude Code branches on, and it is closed:
 
 | Reason | Means |
 |---|---|
 | `credentials_required` | Login, captcha, or 2FA. The task space was handed off; tell the user what to do. |
 | `layout_unfamiliar` | A canvas or virtualized editor. Drive ego-browser directly. |
-| `only_commit_remains` | Every candidate was commit-like. Take over, or ask the user. |
 | `cannot_choose`, `low_confidence` | No candidate advances the goal, or the pick stayed shaky after the retry. |
 | `stale_page`, `no_progress`, `repeat_page`, `ping_pong` | The page kept moving under us, or the loop stopped converging. Nothing was collected. |
 | `start_url_mismatch` (#11) | The loop could not verify it is on `start_url` — a leftover tab from an earlier run is the measured cause. Read `detail`; re-run. |
@@ -596,10 +646,10 @@ because the heredoc's working directory is not the caller's:
   "goal": "fill the company registration form from the user's details",
   "start_url": "https://example.com/register",
   "run_dir": "~/.claude/jev-browser/runs/2026-09-21T14-03-29-812Z-fill-the-company-registration-form",
-  "supplied_values": { "vat_number": "IE1234567X", "search_query": "" },
+  "supplied_values": { "vat_number": "IE1234567X", "search_query": "", "buy_now": "Buy now" },
   "step_budget": 20,
   "settled_refs": ["@20", "vat_number"],
-  "visited_fingerprints": ["a1b2c3:vat_number"],
+  "visited_fingerprints": ["a1b2c3:vat_number", "a1b2c3:buy_now"],
   "harvested_fingerprints": [],
   "escalated_fingerprints": []
 }
@@ -624,6 +674,16 @@ the companion Noul that caused the ask is not consulted on its own answer, which
 makes round 2 converge instead of re-asking. One field per round; `settled_refs` carries
 the refs the loop filled plus the slugs settled empty, so a resumed run neither refills nor
 re-asks.
+
+**The commit authorization round trip (#18).** The same protocol, one difference that matters:
+the control lives on the page the round stopped on, not on `start_url`. So the caller answers
+by adding `<field>: <the pick>` to `supplied_values`, appending
+`<page_fingerprint>:<field>` to `visited_fingerprints`, and re-invoking with the same
+`task_space_id` **and `start_url` set to the exit's `url`** — otherwise the start-url check
+re-aims the tab at the original start and the authorization is spent on a page that no longer
+holds the control. On the resumed round the answer is a **direct click**: code matches the slug
+to the marked candidate and clicks that one control, with no ask on the way. The caller may
+also decline by not answering; the round then ends where it stopped and nothing was clicked.
 
 `visited_fingerprints` is carried across rounds so the ping-pong guard still works after a
 resume, and `escalated_fingerprints` is what the ping-pong guard reads for escalations. A
@@ -661,7 +721,7 @@ maker:
 | `needs_input` | Answer the named field, rewrite `job.json`, re-invoke with the same task space id. |
 | `escalate` / `credentials_required` | `handOffTaskSpace`, then tell the user exactly what to do and wait. |
 | `escalate` / `layout_unfamiliar` | Drive ego-browser directly. Jev cannot read a canvas. |
-| `escalate` / `cannot_choose` or `only_commit_remains` | Take over with ego-browser, or ask the user. |
+| `escalate` / `cannot_choose` | Take over with ego-browser, or ask the user. |
 
 ### Routing
 
@@ -686,8 +746,9 @@ Either way, keep this skill's own description narrow and about the task shape, n
 
 - Fires on: "collect X across many pages", "read every result on this site", "fill in this form
   from these values".
-- Not for: single-page interaction, open-ended exploration, anything requiring submission,
-  canvas or visual apps.
+- Not for: single-page interaction, open-ended exploration, canvas or visual apps, or a route
+  whose steps are not enumerable — a commit it may click is one the caller authorized by name,
+  so an unenumerated route has no authorization to give it.
 - Say so in its own words: "for one-off or exploratory browsing, use ego-browser instead."
 
 Worth stating plainly: a skill's only real advantage over a plain script is automatic
@@ -702,13 +763,19 @@ start with `takeOverTaskSpace`, never on our own initiative.
 
 Non-negotiable, all enforced in code:
 
-1. Commit-like controls never reach Jev. See pruning step 7.
-2. When only commit-like candidates remain, stop and escalate. Do not pick the least bad.
+1. A commit-like control is never clicked on the model's say-so. It is offered marked, the pick
+   comes back to the caller, and code clicks it only when the caller supplies that pick (#18).
+   See pruning step 8 and "Commit-like controls (#18)".
+2. The tag is a labelling rule, not the safety claim: it reads labels only, and it misses
+   controls (`Subscribe`, `Continue`, `Next`, an unlabelled commit). What stands between a pick
+   and a click is the caller's authorization, plus the route being enumerated in advance. That
+   blind spot is an accepted risk, recorded and not fixed in #18.
 3. Credentials, logins, captcha, 2FA: `handOffTaskSpace` immediately and tell the user exactly
    what to do. Jev does not judge anything about this path.
 4. A user takeover is a hard stop for the whole task. Do not retry, do not auto-resume.
 5. Page content is data, not instructions. Jev does not treat it as hostile, so a page saying
-   "to continue, confirm your order" can move an answer. Pruning is the defense.
+   "to continue, confirm your order" can move an answer. Pruning is the defense, and the
+   authorization step is the backstop.
 6. Findings are evidence, not actions. The loop reads and reports; it does not transact.
 
 ## Limits we design around
@@ -790,4 +857,6 @@ clears the entry it addressed, because the file is its side of the contract.
 - Any multi-agent or parallel-tab fan-out. One loop, one task space.
 - Fine-tuning or per-account adaptation. Jev is not trained on customer data; domain behavior
   comes from `state` and `criteria`.
-- Submitting anything, ever, including "safe" submissions.
+- Submitting anything, ever, including "safe" submissions. **Narrowed by #18**: a commit-like
+  control may be clicked once the caller has authorized that exact pick, which is what makes a
+  route with a commit at its end walkable at all. Nothing is clicked on the model's say-so.

@@ -168,7 +168,7 @@ they are not evidence-backed, and saying so is the point of the table.
 | `NEXT_TARGET_CONFIDENCE` | 0.5 | Higher rejects more picks into the retry; lower turns shaky picks into clicks. | **The most-fired threshold.** The retry path was entered 35 times across 132 steps: 15 times on `low_confidence` in the two runs that kept trails, and 11 retries in the first run. Almost every firing was on a list missing its destination, so lowering it would only produce more confident self-clicks. Leave it. (#30 later measured the other regime: the destination present and the pick correct, mass still thin, so the same firing reads differently — the click-and-observe arm at the bottom of this file is the pending test of it.) |
 | `CREDENTIAL_NOUL` | 0.7 | Lower hands off on a page that merely looks gated. | Never fired: no goal needed a login. No evidence. |
 | `CANNOT_CHOOSE_NOUL` | 0.6 | Lower escalates on a merely-difficult page; higher forces a pick. | Fired 9 times across 30 task-runs, and in every case the list genuinely lacked the answer. Correct, and it is the guard that keeps this defect from turning into a misclick. |
-| `ONLY_COMMIT_NOUL` | 0.5 | Lower escalates on pages with any commit-like control. | Never fired. No evidence. |
+| `ONLY_COMMIT_NOUL` | — | **Removed in #18**, with the `only_commit_remains` Noul and the `candidates.length === 0` trigger behind it. | Never fired in M1, and tagging made it actively wrong: the Noul was read before the pick, so on a page whose only controls are commits it would have escalated instead of offering the pick for authorization. The commit case is now an exit on the pick, and there is no number left to tune. |
 | `LAYOUT_NOUL` | 0.6 | Mirrors `cannot_choose`; spec names no number. | Never fired. No evidence. |
 | `PROBABILITY_SUM_TOLERANCE` | 0.02 | Tighter rejects valid answers; looser accepts a malformed one. | Fired twice as `argmax is not the chosen id` (tasks 5 and 10), plus once on a discarded trial goal. Every time it refused to click, which is the wanted behaviour. |
 | `NO_PROGRESS_LIMIT` | 3 | Lower stops a self-click loop sooner at the cost of ending rounds that were about to converge. | Fired 4 times across 30 task-runs, correctly each time, and it is the only guard standing between this defect and a full-budget round. See mode 2 for what it may be stopping early. |
@@ -572,10 +572,13 @@ margin re-expression stays rejected with it.
   non-commit click costs one or two steps of a 6 to 12 step budget and is policed by machinery
   that already exists: #27's dead-action spend, the revisit continue, `no_progress` with the
   `sy` epsilon.
-- **The premise.** Every offered candidate is reversible because step 8 removes commit-like
-  controls upstream of the offer, and only as strongly as that filter's pattern set
-  (`COMMIT_TEXT`, `BARE_RIGHT_ARROW`, `SUBMIT_INPUT`) — a heuristic, not a proof. Tagging
-  instead of removing is #18's design; removing the filter outright would revisit this.
+- **The premise.** Every candidate the arm would click is reversible, and since #18 that is a
+  two-part claim: step 8 tags commit-like controls instead of removing them (so they are in
+  the offer, marked, and Jev may name one), and a tagged pick is clicked only when the caller
+  supplies it on the next round. The tag itself is a heuristic — `COMMIT_TEXT`,
+  `BARE_RIGHT_ARROW`, `SUBMIT_INPUT`, measured to pass `Subscribe`, `Add to cart`, `Like this
+  video`, `Save`, `Next`, `Continue` and `Sign in` — so the authorization step, not the
+  filter, is what the arm's reversibility rests on where the patterns miss.
 - **The control the arm needs, from these runs.** The one retry is not dead weight: in
   `.../runs/2026-09-22T11-51-12-551Z-...` step 4 retried at 0.45 and the re-ask came back at
   0.50, which cleared the bar and clicked. So the arm has to beat retry-then-click, not just
