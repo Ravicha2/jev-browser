@@ -14,6 +14,14 @@
 // denylist only decides what is marked; the authorization is what stands between
 // a pick and a click (`offerRow` and `authorizedPick` below).
 //
+// #19 gives an action-shaped goal a way to reach `done`. `goal_met` is a
+// relevance score, and on an action-shaped goal it reads low whether the action
+// did nothing or did exactly what was asked (the YouTube probe and the #30
+// LinkedIn round are the two poles). So a `job.json` that declares
+// `goal_shape: "action"` gets one extra id in the `next_target` choice —
+// `done` — offered from the first step that has clicked something, and naming it
+// is `done`. The exit says which judgment finished the round (`finished_by`).
+//
 // #9 makes the loop gather something. When `goal_met` fires, or a page reads as
 // one the goal asks us to read, a second ask pairs a selection Choice over
 // spans code copied from the visible snapshot with a `has_answer` Noul; code
@@ -60,6 +68,24 @@ const REVISIT_LIMIT = 1 // re-decisions granted per fingerprint before repeat_pa
 // id. Anything else and nothing executes.
 const PROBABILITY_SUM_TOLERANCE = 0.02
 const NO_ANSWER = 'none'
+// The terminal-action sentinel (#19), a second id beside `none` in the same
+// `next_target` choice. An action-shaped goal (`goal_shape` in job.json) gets it
+// offered once the round has clicked something, and naming it is `done`: the
+// action the goal asks for is visible as already done on this page. A row in the
+// choice rather than a seventh Noul, because the choice head is the one this loop
+// already validates hardest (the model selects an id, and a written action object
+// is the 34.0% invalid shape), and because the question count is a reliability
+// product (spec.md "Confidence"). The mass it wins against is the mass the
+// candidates were competing for, so it is read like a pick: as a confidence.
+const DONE_ANSWER = 'done'
+// The terminal row's own bar (#19), below the pick gate on purpose. Calibrated
+// 2026-09-22 against a clip verified playing while the model read `done` at 0.40
+// and 0.46 on two rounds, and against `NEXT_TARGET_CONFIDENCE` refusing both:
+// 0.5 turns the probe into a coin flip, 0.40 is the measured true-positive floor.
+// Not lower: no reading anywhere puts a false `done` under it, and a floor with
+// no measured false-positive band under it is where the evidence stops, not where
+// a margin starts (references/thresholds.md, "The terminal action (#19)").
+const DONE_CONFIDENCE = 0.4
 
 // Guards. Three consecutive actions with no page change means blocked: that
 // counts no *progress*, which is the thing worth counting, not no navigation.
@@ -397,19 +423,23 @@ export function validateChoice(response, id, offeredIds) {
 
 // Read the answers in the order spec.md "The step loop" branches on them, so a
 // credential page stops before anything else is even considered.
-export function readDecision({ response, candidates, retried }) {
+export function readDecision({ response, candidates, retried, terminal = false }) {
   const retryOr = (trigger) => (retried ? { kind: 'escalate', reason: trigger } : { kind: 'retry', trigger })
 
   if (readNoul(response, 'needs_credential') > CREDENTIAL_NOUL) {
     return { kind: 'escalate', reason: 'credentials_required' }
   }
-  if (readNoul(response, 'goal_met') >= GOAL_MET) return { kind: 'done' }
+  if (readNoul(response, 'goal_met') >= GOAL_MET) return { kind: 'done', by: 'goal_met' }
   if (readNoul(response, 'layout_unfamiliar') > LAYOUT_NOUL) {
     return { kind: 'escalate', reason: 'layout_unfamiliar' }
   }
   if (readNoul(response, 'cannot_choose') > CANNOT_CHOOSE_NOUL) return retryOr('cannot_choose')
 
-  const offered = [...candidates.map((candidate) => candidate.ref), NO_ANSWER]
+  const offered = [
+    ...candidates.map((candidate) => candidate.ref),
+    ...(terminal ? [DONE_ANSWER] : []),
+    NO_ANSWER,
+  ]
   let choice
   let confidence
   try {
@@ -425,6 +455,15 @@ export function readDecision({ response, candidates, retried }) {
   }
 
   if (choice === NO_ANSWER) return retryOr('cannot_choose')
+  // The terminal judgment (#19). `done` is a pick like any other and gets the
+  // same one retry a shaky pick gets, against its own bar: a terminal action the
+  // model is not sure of retries, and a second shaky answer escalates rather than
+  // exiting on a coin flip. `goal_met` still runs first — a page that states the
+  // answer outright is a `done` no terminal reading needs to reach.
+  if (choice === DONE_ANSWER) {
+    if (confidence < DONE_CONFIDENCE) return retryOr('low_confidence')
+    return { kind: 'done', by: 'terminal_action' }
+  }
   if (confidence < NEXT_TARGET_CONFIDENCE) return retryOr('low_confidence')
 
   const index = candidates.findIndex((candidate) => candidate.ref === choice)
@@ -472,15 +511,19 @@ export function shouldScrollPage({ stuck, revisit = false, worthReading, moreBel
 // output tokens are free and they run in parallel, so ask for branches we may
 // not take and read only the one we need. Question ids are for code and are not
 // sent to the model, so each instruction has to carry its own meaning.
-export function buildQuestions(candidates) {
+export function buildQuestions(candidates, { terminal = false } = {}) {
   const criteria = {}
   for (const candidate of candidates) criteria[candidate.ref] = candidate.label
   criteria[NO_ANSWER] = 'None of these leads toward the goal'
+  // The terminal row (#19) is offered only to an action-shaped goal that has
+  // already acted, so every other round's choice is exactly what it was.
+  if (terminal) criteria[DONE_ANSWER] = 'The action `goal` asks for is already visible as done on this page'
 
   return {
     next_target: {
       type: 'choice',
-      instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list. A row marked (current), (selected) or (expanded) is already open; a row marked (commit) submits, sends, pays or deletes, so naming one asks for confirmation instead of clicking it. Choose `none` if none does.',
+      instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list. A row marked (current), (selected) or (expanded) is already open; a row marked (commit) submits, sends, pays or deletes, so naming one asks for confirmation instead of clicking it. Choose `none` if none does.'
+        + (terminal ? ' Choose `done` if the action `goal` asks for is now visible as done, rather than merely reachable.' : ''),
       criteria,
     },
     goal_met: {
@@ -912,6 +955,11 @@ async function main() {
   let steps = 0
   let retried = false
   let stale = 0
+  // Has this round clicked anything yet (#19)? The terminal judgment is offered
+  // only once a candidate terminal step has happened, so a round that has not
+  // acted is asked exactly the questions it was asked before. Set by the
+  // direct-click authorization channel too: that is a click.
+  let acted = false
   let progress = { lastFingerprint: null, lastSy: null, noProgress: 0 }
   // The most recent click, cleared whenever the page changes: its label is the
   // input to the dead-repeat half of the scroll decision, and its target is
@@ -1179,6 +1227,7 @@ async function main() {
       writeTrace(entry)
       progress = actedBaseline(progress, { fingerprint: fresh.fingerprint, sy: actedSy })
       lastAction = { label: authorized.candidate.label, target_url: authorized.candidate.url ?? null }
+      acted = true
       retried = false
       spentUrls.clear()
       spentLabels.clear()
@@ -1213,7 +1262,8 @@ async function main() {
     // written once so the Choice criteria and the `candidates` field cannot
     // disagree about what row 23 is.
     const offered = candidates.map(offerRow)
-    const questions = buildQuestions(offered)
+    const terminal = job.goal_shape === 'action' && acted
+    const questions = buildQuestions(offered, { terminal })
     const state = fitState({
       goal: job.goal,
       current_page: observed.pageText.slice(0, MAX_PAGE_CHARS),
@@ -1234,7 +1284,7 @@ async function main() {
     tally(response)
     stepAnswers = answersOf(response)
 
-    const decision = readDecision({ response, candidates, retried })
+    const decision = readDecision({ response, candidates, retried, terminal })
 
     // Extraction (#9). `goal_met` is a probability, not a value — it cannot
     // produce a finding. When it fires, or the page reads as one the goal asks
@@ -1303,6 +1353,10 @@ async function main() {
           model: response.model,
           task_space_id: task.id,
           goal_met: readNoul(response, 'goal_met'),
+          // Which judgment finished the round (#19). A `done` reached by the
+          // terminal row can carry a low `goal_met` — that is the case this
+          // exists for — so the exit says which one it was.
+          finished_by: decision.by,
           usage: response.usage ?? null,
           harvested_fingerprints: [...harvested],
           trail: recorded('done'),
@@ -1486,6 +1540,7 @@ async function main() {
     progress = actedBaseline(progress, { fingerprint: fresh.fingerprint, sy: actedSy })
     // The target as well as the label: a dead action spends the former (#27).
     lastAction = { label: decision.label, target_url: candidates[decision.index]?.url ?? null }
+    acted = true
     retried = false
     spentUrls.clear()
     spentLabels.clear()
@@ -1827,8 +1882,8 @@ async function runSelfCheck() {
   })
   const candidates = [{ ref: '@1', label: 'Read more' }]
   const two = [{ ref: '@1', label: 'Read more' }, { ref: '@2', label: 'Help' }]
-  const decided = (value, { retried = false, offered = candidates } = {}) => (
-    readDecision({ response: value, candidates: offered, retried })
+  const decided = (value, { retried = false, offered = candidates, terminal = false } = {}) => (
+    readDecision({ response: value, candidates: offered, retried, terminal })
   )
 
   const sure = { choice: '@1', confidence: 0.8, probabilities: { '@1': 0.8, none: 0.2 } }
@@ -1885,6 +1940,47 @@ async function runSelfCheck() {
   rejects({ choice: '@1', confidence: 0.8, probabilities: { '@1': 0.5, none: 0.3 } }, 'a sum below tolerance')
   // A malformed answer never reaches the click: the retry carries no index.
   assert.ok(!('index' in decided(response({ choice: '@9', confidence: 0.9, probabilities: sure.probabilities }))))
+
+  // The terminal judgment (#19). The `done` id is offered only to an
+  // action-shaped goal that has already acted, and when it is, naming it is a
+  // `done` read with the same bar as any other pick.
+  const terminalRow = buildQuestions([{ ref: '@1', label: 'Read more' }], { terminal: true })
+  const plainRow = buildQuestions([{ ref: '@1', label: 'Read more' }])
+  assert.equal(terminalRow.next_target.criteria.done, 'The action `goal` asks for is already visible as done on this page', 'the terminal row is a criterion')
+  assert.ok(/Choose `done`/.test(terminalRow.next_target.instructions), 'and the instruction names it')
+  assert.ok(!('done' in plainRow.next_target.criteria), 'a round that has not acted is asked the questions it always was')
+  assert.ok(!/Choose `done`/.test(plainRow.next_target.instructions), 'and its instruction is unchanged')
+
+  const done = { choice: 'done', confidence: 0.72, probabilities: { '@1': 0.2, none: 0.08, done: 0.72 } }
+  // 0.40 is the calibrated floor: the lowest verified true reading in the
+  // calibration, so it is accepted, and a reading under it is not.
+  const floorDone = { choice: 'done', confidence: 0.4, probabilities: { '@1': 0.35, none: 0.25, done: 0.4 } }
+  const shakyDone = { choice: 'done', confidence: 0.35, probabilities: { '@1': 0.33, none: 0.27, done: 0.4 } }
+  assert.deepEqual(
+    decided(response(done), { terminal: true }), { kind: 'done', by: 'terminal_action' },
+    'the terminal row reaching done',
+  )
+  assert.equal(
+    decided(response(floorDone), { terminal: true }).kind, 'done',
+    'and the measured true-positive floor clears the bar',
+  )
+  assert.equal(
+    decided(response(done), { terminal: true, retried: true }).kind, 'done',
+    'and the retry budget does not gate it',
+  )
+  assert.equal(decided(response(shakyDone), { terminal: true }).trigger, 'low_confidence', 'a shaky terminal reading retries')
+  assert.equal(
+    decided(response(shakyDone), { terminal: true, retried: true }).reason, 'low_confidence',
+    'then escalates rather than exiting on a coin flip',
+  )
+  // The row has to have been offered: an answer naming `done` on a round that
+  // never acted is an id we did not offer, and nothing executes on it.
+  assert.equal(decided(response(done)).trigger, 'invalid_response', 'done is not honored where it was not offered')
+  assert.equal(decided(response(done)).kind, 'retry', 'it gets the same one retry as any malformed answer')
+  // A relevance `done` is unchanged and says so: the exit's `finished_by` names
+  // which of the two judgments finished the round.
+  assert.equal(decided(response(sure, { goal_met: 0.8 })).by, 'goal_met', 'the goal_met path is tagged')
+  assert.equal(decided(response(sure)).kind, 'click', 'and a click carries no tag')
 
   // A malformed Noul is not a number we can threshold, so it never becomes one.
   assert.throws(() => readNoul({ answers: { goal_met: { type: 'noul', noul: 'yes' } } }, 'goal_met'))

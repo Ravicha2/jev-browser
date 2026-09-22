@@ -592,3 +592,76 @@ margin re-expression stays rejected with it.
 
 If the arm wins, `NEXT_TARGET_CONFIDENCE` stops being the checkpoint for navigation and stays
 what it is measurably good at: the trigger for the one retry before the posterior takes over.
+
+## The terminal action (#19): `done` as a row, and its bar
+
+An action-shaped goal could not reach `done`. `goal_met` is a relevance score, and on an
+action-shaped goal it reads low in both directions: while the action did nothing (the YouTube
+probe, `goal_met` 0.2, 0.22, 0.2, 0.68 against its 0.8 bar) and while it did exactly what was
+asked (#30: the LinkedIn click lands the named listing and `goal_met` reads 0.21 to 0.36 across
+23 rounds, none of them reaching `done`). The fix is not a better `GOAL_MET` value: it is a
+second judgment, asked as an action verb.
+
+### What was built
+
+`job.json` declares `goal_shape: "action"`; from the first step that has clicked something, the
+`next_target` choice carries one more id, `done` ("the action `goal` asks for is already visible
+as done on this page"). Naming it is `decision.kind === 'done'`, which is also what opens the
+harvest gate. A row in the choice rather than a seventh Noul, because the question count is a
+reliability product and because the choice head is the one this loop validates hardest.
+
+### The calibration: six rounds, 2026-09-22, `jev-1.13.0`
+
+| # | run | goal / site | action verifiably taken? | `done` conf / mass | `goal_met` | outcome |
+|---|---|---|---|---|---|---|
+| A | `12-53-02-309Z-play-a-clip…` | probe, YouTube search | yes: `video.paused` false, 1492s of 3088s | 0.59 / 0.62 | 0.59 | `done`, `finished_by` `terminal_action` |
+| A2 | `12-58-19-247Z-play-a-clip…` | probe, YouTube search | yes: `video.paused` false, 44s of 1350s | 0.40 / 0.44, then 0.46 / 0.50 | 0.41, 0.5 | refused at 0.5, `escalate low_confidence` |
+| A3 | `13-00-12-311Z-play-a-clip…` | probe, YouTube search | yes: on `watch?v=7l6bXLAKyEI` | 0.46 / 0.50 | 0.5 | `done` at the 0.40 bar; refused at 0.5 |
+| B | `12-54-06-178Z-open-the-first-job…` | #30 goal, LinkedIn | yes: the pinned listing's detail pane is open | 0.69 / 0.70 | 0.28 | `done`, `finished_by` `terminal_action` |
+| C | `12-56-47-588Z-open-the-job-listing-titled…` | impossible listing, LinkedIn | no: the model named `none` at both steps | row never picked | 0.04 | `escalate cannot_choose` |
+| D | `13-00-36-524Z-open-the-page-that-documents…` | docs navigation, nodejs.org | yes: on `child_process.html` | 0.74 / 0.75 | 0.71 | `done` with a non-empty ledger |
+
+All six under `~/.claude/jev-browser/runs/`. `done` conf / mass is the `next_target` answer's
+`confidence` and the probability it put on the `done` row; `goal_met` is the same step's
+relevance reading, and it is the number the row exists to stop trusting. The A2 and A3 rows are
+also the live record of the bar: both were refused by 0.5 and both clear 0.40.
+
+Two readings off this table.
+
+1. **The true-positive floor is 0.40, and 0.5 refuses it.** A2's clip was verified playing with
+   the model reading `done` at 0.40 and 0.46; `NEXT_TARGET_CONFIDENCE` (0.5) threw both away and
+   ended the round on an action that had succeeded, which is the failure this issue exists to
+   remove. `DONE_CONFIDENCE` is therefore 0.40: the measured floor of a true `done`. Not lower —
+   nothing in the table, or in the 23 #30 rounds, puts a false `done` beneath it. **The
+   false-positive floor is unmeasured**, so 0.40 is where the evidence stops rather than where a
+   margin starts; #21's arm, which runs the fixed action goals control-against-arm, is the
+   instrument that would bound it, and this number should move if it does.
+2. **The row behaved well where the action failed.** C, the one pole built to fail, never picked
+   the row: an unattainable end state makes the model name `none` or keep naming candidates
+   (C2 and C3: the same page with a dead current card, pick 0.44 to 0.49 mass on the card, under
+   the pick gate, so no action and no terminal reading at all). C is therefore a weak negative:
+   it says the row does not fire on an unreachable end state, not that it fires correctly on a
+   reachable one that a click missed.
+
+### The harvest gate, live
+
+`done` opens the extraction ask — `harvestDue` fires on `decision.kind === 'done'` regardless of
+`worth_reading`. Verified in every round above that reached `done`: `extraction.asked: true` in
+A, A3, B and D, and in A2 the ask was never due because the terminal row was refused and the
+step stayed a retry.
+
+The ledger is a different question and it is #04's. On the two action sites that end on a video
+or a job pane, the extraction ask runs and appends nothing: A `span_choice none`, `has_answer`
+0.55; A3 `span_choice none`, `has_answer` 0.48; B `span_choice none`, `has_answer` 0.22. D, whose
+end state is a documentation page, appends one finding (`has_answer` 0.66, so `tentative: true`).
+So a terminal `done` reaches a non-empty ledger exactly when the page it lands on is a page with
+answer spans in it, which is a property of the site, not of the terminal judgment.
+
+### The cost
+
+| | |
+|---|---|
+| Extra requests | none. The row and its instruction travel inside the request the step already sends, and only for a declared action goal that has acted. |
+| Extra tokens | one criteria entry and one sentence of instruction, ~40 characters, on the steps that offer it. |
+| Question count | unchanged: 6 questions everywhere, the seventh id appearing inside a head that was already being asked. |
+| Code | `DONE_ANSWER`, `DONE_CONFIDENCE`, the `terminal` argument to `buildQuestions` and `readDecision`, `acted` in the loop: ~25 lines with comments, no change to `prune.js` or `ledger.js`. |

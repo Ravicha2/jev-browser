@@ -128,6 +128,11 @@ Rules:
 - The goal and the resume answer travel in `job.json`, not in environment variables. That is
   injection-free (a goal string may contain arbitrary characters and must not be interpolated
   into a shell command) and makes every round reproducible and debuggable.
+- `job.json` also declares the goal's **shape**: `"goal_shape": "action"` says the end state is
+  an action taken rather than a fact read, which is what puts the `done` row in the offer
+  (#19). Absent, or any other value, keeps the relevance path. It is a field and not a reading
+  of the goal's wording because the caller already owns this file and goal wording has not held
+  as a signal across six measured rounds.
 
 Verified capabilities of the heredoc runtime (Node v24.18.0):
 
@@ -177,6 +182,21 @@ facts ride in the row's text rather than as a second field per candidate: `crite
 `{ref: text}` map, and prefixing a string is a smaller change than widening the protocol. See
 "The offer's shape" under Candidate pruning for what was measured and what it cost.
 
+**7. `done` is an action verb, not another Noul (#19).** An action-shaped goal — one whose end
+state is an action taken rather than a fact read — declares itself with `goal_shape: "action"`
+in job.json, and from the first step that has clicked something the `next_target` choice
+carries one more id, `done`: the action the goal asks for is already visible as done on this
+page. Naming it is `decision.kind === 'done'`. `goal_met` cannot serve here: it is a relevance
+score, and on an action-shaped goal it reads low whether the action did nothing or did exactly
+what was asked (the probe and the #30 LinkedIn round are the two poles). The row sits in the
+choice rather than as a seventh Noul for two reasons: the question count is a reliability
+product (decision 5, and "Confidence" below), and the choice head is the one this loop
+validates hardest — the model selects an id out of an offer, against writing an action object,
+the 34.0% invalid shape (arXiv 2603.14248). The mass `done` wins against is the mass the
+candidates were competing for, so it is read as a `confidence` under its own bar. See "The
+terminal action (#19)" in references/thresholds.md for the calibration, and "Confidence" below
+for the number.
+
 ## The step loop
 
 One heredoc per round. Loop inside it, print one JSON object, exit.
@@ -191,6 +211,9 @@ One heredoc per round. Loop inside it, print one JSON object, exit.
      - credential needed        -> handOffTaskSpace, exit escalate
      - commit-like pick         -> exit needs_input: authorize this control (#18)
      - goal met                 -> exit done
+     - the terminal row is the pick (#19)
+                                -> exit done: the action-shaped goal's end state is
+                                   visible as done, on its own bar
      - no candidate advances    -> scroll one viewport if the page is worth
                                    reading and unread below; otherwise retry
                                    once, then exit escalate
@@ -437,8 +460,16 @@ questions = {
   // answerable from the offer itself.
   next_target: {
     type: 'choice',
-    instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list, and a row marked (current), (selected) or (expanded) is already open. Choose `none` if none does.',
-    criteria: { ...offered.map(row => [row.ref, row.label]), none: 'None of these leads toward the goal' },
+    instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list, and a row marked (current), (selected) or (expanded) is already open. Choose `none` if none does.'
+      // Appended, with the row below, only on an action-shaped goal that has
+      // already acted (#19):
+      + ' Choose `done` if the action `goal` asks for is now visible as done, rather than merely reachable.',
+    criteria: {
+      ...offered.map(row => [row.ref, row.label]),
+      none: 'None of these leads toward the goal',
+      // Only when `goal_shape: "action"` and the round has clicked something.
+      done: 'The action `goal` asks for is already visible as done on this page',
+    },
   },
 
   // Termination.
@@ -493,10 +524,20 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | `has_answer.noul` | >= 0.35, < 0.7 | the chosen span is copied with `tentative: true`: the model named a line its own `has_answer` did not back, and the round would otherwise end with an empty ledger |
 | `has_answer.noul` | < 0.35 | the cookbook's absent band: no entry. A firing `goal_met` on a page this low is a disagreement the trace records. |
 | `next_target.confidence` | < 0.5 | retry once over the same list, then escalate. Open: a measured click-and-observe arm, below |
+| `next_target` = `done` (#19) | >= 0.4 | exit done: the action an action-shaped goal asks for is visible as already done. Below it, the same one retry then escalate as any other pick |
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
 | `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
 | `worth_reading.noul` | > 0.5 | with a retry pending, or a granted revisit (#11): scroll one viewport before spending it, max 3 per page |
 | any field `choice` confidence | < 0.5 | leave the field, report it in `needs_input` |
+
+The terminal row's bar is its own number and is deliberately below the pick gate's (#19). It
+is calibrated, not chosen: on two live rounds of the probe the clip was verified playing
+against a `done` reading of 0.40 and 0.46, and `NEXT_TARGET_CONFIDENCE` refused both, so 0.5
+makes the probe a coin flip and 0.40 is the measured true-positive floor. It is not lower
+because nothing measured puts a false `done` under it: a floor with no measured
+false-positive band beneath it is where the evidence stops, not where a margin starts. The
+two rows are one answer read under two bars, which is why they are two numbers rather than
+one.
 
 There is no commit threshold any more: tagging made it a mark on a candidate rather than a
 number to compare, and the pick's own exit carries the decision (#18).
@@ -530,12 +571,19 @@ back to Claude Code. No other channel is needed, because the heredoc exits betwe
 anyway.
 
 ```json
-{ "status": "done",        "goal": "...", "findings": [ ... ], "steps": 7, "url": "..." }
+{ "status": "done",        "goal": "...", "findings": [ ... ], "steps": 7, "url": "...",
+  "finished_by": "goal_met" | "terminal_action" }
 { "status": "needs_input", "field": "vat_number", "wants": "a VAT registration number", "page_fingerprint": "..." }
 { "status": "needs_input", "field": "buy_now", "wants": "authorization to click the \"Buy now\" control",
   "pick": { "ref": "@21", "label": "Buy now", "confidence": 0.82 }, "page_fingerprint": "...", "url": "..." }
 { "status": "escalate",    "reason": "credentials_required", "step": 9, "page_fingerprint": "...", "partial_findings": [ ... ] }
 ```
+
+A `done` names which judgment finished the round in `finished_by` (#19). `goal_met` is the
+relevance path; `terminal_action` is the action-shaped goal's end state. The two can disagree —
+a terminal `done` can carry a low `goal_met`, which is the whole case that decision exists for
+— so the exit says which one it was rather than leaving the reader to infer it from the
+numbers.
 
 `needs_input` and `escalate` are deliberately separate. Escalate means "I cannot proceed."
 Needs_input means "I can proceed, but I need a value I do not have," and it names the value so
