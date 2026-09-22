@@ -403,6 +403,27 @@ inventing new ones. Four goals, each run 15 times per configuration:
 | `open the job listing titled <a title absent from this page>` | the same LinkedIn url | negative: the end state cannot be reached | pole C of the #19 calibration |
 | `play the clip with id <an id that cannot play>` | the same YouTube search url | negative: the end state cannot be reached | drawn to C's shape |
 
+**The LinkedIn rows cannot hold a fixed `start_url`, measured.** LinkedIn rewrites the search URL
+on every navigation, injecting a `currentJobId` that differs each time, in a logged-in profile:
+navigating to `https://www.linkedin.com/jobs/search?keywords=AI` lands on
+`.../search/?currentJobId=4468532332&keywords=AI`, and the trailing-slash and extra-parameter forms
+are rewritten the same way (three navigations, three different ids). `matchesStartUrl`
+(`scripts/explore.js:271`) is exact-match after stripping only the fragment and a trailing slash, so
+every round whose `start_url` is the plain URL refuses at step 0 with `start_url_mismatch`, at zero
+cost and zero requests (six such rounds are in `evals/runs/round-record.jsonl`). This is the "URL
+rewrite" that `learnings/linkedin` Rule 1 records, arriving as a hard blocker rather than a
+candidate-thinness problem. Two consequences the implementer must carry:
+
+- Those six rounds measure nothing about the terminal judgment. They are recorded as invalid for
+  C2, C3 and T9 and are not counted as failures of either arm; the plan's `start_url_mismatch`
+  branch is the caller's response, and the caller did re-aim, which is why the seventh attempt ran.
+- The pole is runnable only with a caller re-aim that pins `start_url` to the tab's current URL
+  before each round, per the SKILL.md remedy for `start_url_mismatch` ("close or re-aim, re-run").
+  That makes `start_url` a per-round measured variable rather than a constant, so the run record
+  must carry it per trial (M1 already does) and the arm comparison reads it as recorded, not as
+  fixed. The re-aim is identical before every trial in both arms, so it is constant across the
+  comparison even though the value differs trial to trial.
+
 The negative poles exist so the declared arm produces a false-terminal rate and not only a
 true-positive one: `references/thresholds.md` records that the false-positive floor under 0.40 is
 unmeasured, and this is the instrument that bounds it. The two negative goal strings are written by
