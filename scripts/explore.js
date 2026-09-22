@@ -93,20 +93,46 @@ const RUNS_ROOT = `${HOME}/.claude/jev-browser/runs`
 
 // ---------------------------------------------------------------- pure control
 
-// The paths spent by a return: the click that left the page we are back on,
-// and the click that brought us back. A collection agent returning from a
-// wrong cross-reference is recovery, not wandering — the repeat-page guard
-// grants one re-decision per fingerprint, and those two paths are exhausted.
 // A path is a target url when the tree gave one, and only falls back to the
 // label for url-less controls (#11): a same-labelled twin — a docs page's
 // cross-reference and its real section anchor share the text — is a different
 // path, and spending the label spent both twins, which is how task 5 died.
+// `target_url` is the field a click's trail entry records it under.
+export function pathToSpend(entry) {
+  if (!entry || !entry.label) return null
+  return { label: entry.label, url: entry.target_url ?? null }
+}
+
+// Spend a path: the url when there is one, the label only as the fallback for
+// a url-less click; nothing at all for no path. One predicate, so a dead action
+// (#27) and a revisit (#11) retire a target by the same key.
+export function spendPath(path, spentUrls, spentLabels) {
+  if (!path) return
+  if (path.url) spentUrls.add(path.url)
+  else spentLabels.add(path.label)
+}
+
+// The paths spent by a return: the click that left the page we are back on,
+// and the click that brought us back. A collection agent returning from a
+// wrong cross-reference is recovery, not wandering — the repeat-page guard
+// grants one re-decision per fingerprint, and those two paths are exhausted.
 export function pathsToSpend(history) {
   return history
     .filter((entry) => typeof entry.decision === 'string' && entry.decision.startsWith('click'))
     .slice(-2)
-    .map((entry) => ({ label: entry.label ?? null, url: entry.target_url ?? null }))
-    .filter((entry) => entry.label)
+    .map(pathToSpend)
+    .filter(Boolean)
+}
+
+// The dead-action terminal (#27): the last action was a click that changed
+// nothing and every remaining candidate is one it already tried. `no_progress`
+// rather than `cannot_choose`, because the loop acted and nothing moved, which
+// is what that reason already means, and because the alternative sends Jev a
+// list of one `none`. On a page with many dead candidates the count reaches
+// `NO_PROGRESS_LIMIT` first and ends the round there, so exhaustion is the
+// small-page half of the same ending.
+export function deadEnd({ lastAction, candidates, spent }) {
+  return lastAction !== null && !candidates.some((candidate) => !spent(candidate))
 }
 
 // The round is only ever about the page it started on. openOrReuseTab is
@@ -737,17 +763,19 @@ async function main() {
   let retried = false
   let stale = 0
   let progress = { lastFingerprint: null, lastSy: null, noProgress: 0 }
-  // The most recent click's label, cleared whenever the page changes; the
-  // input to the dead-repeat half of the scroll decision.
+  // The most recent click, cleared whenever the page changes: its label is the
+  // input to the dead-repeat half of the scroll decision, and its target is
+  // what a dead action spends before the next decision (#27).
   let lastAction = null
   // Read-scrolls spent per fingerprint. Keyed on the fingerprint, which is
   // scroll-stable, so scrolling a page never resets its own count.
   const pageScrolls = new Map()
   // Re-decisions spent per fingerprint by the repeat-page guard.
   const revisits = new Map()
-  // Paths exhausted by the latest revisit-continue; offered to no ask until
-  // the next action retires them. Urls when the tree gave one (#11: spending
-  // the label spent the twin too), labels only as the url-less fallback.
+  // Paths exhausted by the latest revisit-continue or dead action (#27);
+  // offered to no ask until the next action retires them. Urls when the tree
+  // gave one (#11: spending the label spent the twin too), labels only as the
+  // url-less fallback.
   const spentUrls = new Set()
   const spentLabels = new Set()
   const spent = (candidate) => (candidate.url
@@ -846,6 +874,18 @@ async function main() {
     // run of dead actions makes a pick a dead repeat.
     if (progress.noProgress === 0) lastAction = null
 
+    // A dead action spends its own target before the next decision (#27). An
+    // action that changed nothing is the one signal that the pick was right
+    // about the content and wrong about the state: LinkedIn's already-selected
+    // job card is a no-op click, and Jev, stateless between steps, names it
+    // again because the page never said otherwise. Nothing the loop already has
+    // breaks that tie: the page is never left, so it never enters `visited`, so
+    // `repeat_page` never fires, so nothing is ever spent. The spend is one
+    // action deep (the next click clears the sets), so each dead action retires
+    // exactly the target it just proved dead. A click that changed the page is
+    // the progress signal the loop already has and spends nothing.
+    if (progress.noProgress >= 1) spendPath(pathToSpend(lastAction), spentUrls, spentLabels)
+
     const stop = preflight({
       step: steps,
       budget,
@@ -865,10 +905,7 @@ async function main() {
       if (seen < REVISIT_LIMIT) {
         revisits.set(observed.fingerprint, seen + 1)
         visited.delete(observed.fingerprint)
-        for (const path of pathsToSpend(history)) {
-          if (path.url) spentUrls.add(path.url)
-          else spentLabels.add(path.label)
-        }
+        for (const path of pathsToSpend(history)) spendPath(path, spentUrls, spentLabels)
         revisitPending = true
       } else {
         writeTrace({
@@ -918,6 +955,31 @@ async function main() {
     const candidates = anySpent()
       ? observed.candidates.filter((candidate) => !spent(candidate))
       : observed.candidates
+
+    // Every candidate the dead action left is now spent itself (#27): the loop
+    // has run out of things to try, and it acted and nothing moved, which is
+    // `no_progress`. Reached before the ask, because there is nothing to ask
+    // over: offered, the list would hold one `none` and the exit would come
+    // back as `cannot_choose`, a decision the loop did not make.
+    if (deadEnd({ lastAction, candidates: observed.candidates, spent })) {
+      writeTrace({
+        step: steps,
+        url: observed.url,
+        fingerprint: observed.fingerprint,
+        sy: observed.sy,
+        candidates: 0,
+        decision: 'stop:no_progress',
+        latency_ms: null,
+        usage: null,
+      })
+      return exitObject({
+        status: 'escalate',
+        reason: 'no_progress',
+        step: steps,
+        state: observed,
+        extra: { goal: job.goal, trail: history.slice(-TRAIL_STEPS), ...(ledgerExtras()) },
+      })
+    }
     const questions = buildQuestions(candidates)
     const state = fitState({
       goal: job.goal,
@@ -1137,7 +1199,8 @@ async function main() {
     // (#17). Acting also refreshes the retry budget: "retry once, then
     // escalate" is a rule about one decision, not about the whole run.
     progress = actedBaseline(progress, { fingerprint: fresh.fingerprint, sy: actedSy })
-    lastAction = { label: decision.label }
+    // The target as well as the label: a dead action spends the former (#27).
+    lastAction = { label: decision.label, target_url: candidates[decision.index]?.url ?? null }
     retried = false
     spentUrls.clear()
     spentLabels.clear()
@@ -1169,7 +1232,7 @@ function anchorRepeat(fp, base, { baselineAfterAction }) {
     if (run.noProgress === 0) lastAction = null
     const exit = preflight({ ...base, budget, step, noProgress: run.noProgress })
     if (exit) return `${exit.reason} at step ${step}`
-    const deadRepeat = run.noProgress >= 1 && lastAction === ANCHOR_LABEL
+    const deadRepeat = run.noProgress >= 1 && lastAction?.label === ANCHOR_LABEL
     if (shouldScrollPage({ stuck: deadRepeat, worthReading: 0.9, moreBelow: true, scrolls })) {
       scrolls += 1
       position = Math.round(observed.sy + VIEWPORT)
@@ -1178,9 +1241,44 @@ function anchorRepeat(fp, base, { baselineAfterAction }) {
     }
     position = ANCHOR_SY // reveal(), then the href scroll, both before the baseline is read
     run = actedBaseline(run, { fingerprint: fp, sy: baselineAfterAction ? position : observed.sy })
-    lastAction = ANCHOR_LABEL
+    lastAction = { label: ANCHOR_LABEL }
   }
   return 'never exited'
+}
+
+// The LinkedIn shape (#27): a stable page (the fingerprint and the scroll
+// position never move) whose every candidate is a dead click. Jev is stateless
+// between steps, so the stand-in for it here is "the first candidate still on
+// offer", which is the same pick the real one made three times over. Drives the
+// loop's own pieces in the loop's own order: observe, spend the dead action's
+// target, the dead-end terminal, the guards, the act.
+function deadClicksStablePage(labels) {
+  const spentUrls = new Set()
+  const spentLabels = new Set()
+  const spent = (candidate) => (candidate.url
+    ? spentUrls.has(candidate.url)
+    : spentLabels.has(candidate.label))
+  const candidates = labels.map((label, index) => ({ ref: `@${index}`, label, url: `https://x.io/${index}` }))
+  const picked = []
+  let lastAction = null
+  let progress = { lastFingerprint: null, lastSy: null, noProgress: 0 }
+  for (let step = 1; step <= 20; step += 1) {
+    progress = progressAfter(progress, { fingerprint: 'stable', sy: 0 })
+    if (progress.noProgress === 0) lastAction = null
+    if (progress.noProgress >= 1) spendPath(pathToSpend(lastAction), spentUrls, spentLabels)
+    if (deadEnd({ lastAction, candidates, spent })) return { reason: 'no_progress', step, picked }
+    const stop = preflight({
+      step, budget: 12, candidates, commitOnly: false,
+      fingerprint: 'stable', noProgress: progress.noProgress,
+      visited: new Set(), escalated: new Set(),
+    })
+    if (stop) return { reason: stop.reason, step, picked }
+    const pick = candidates.filter((candidate) => !spent(candidate))[0]
+    picked.push(pick.label)
+    lastAction = { label: pick.label, target_url: pick.url }
+    progress = actedBaseline(progress, { fingerprint: 'stable', sy: 0 })
+  }
+  return { reason: 'never exited', picked }
 }
 
 async function runSelfCheck() {
@@ -1356,6 +1454,57 @@ async function runSelfCheck() {
     'a url-less click spends its label',
   )
   assert.deepEqual(pathsToSpend([{ step: 1, decision: 'retry:low_confidence' }]), [], 'no clicks, nothing spent')
+
+  // The dead action (#27): the pick was right about the content and wrong about
+  // the state, the page never moves, and the loop has no other response. The
+  // target is spent by the same key a revisit spends by (the url, with the
+  // label only as the url-less fallback), so a same-labelled twin that has not
+  // been tried is still offered.
+  assert.deepEqual(
+    pathToSpend({ label: 'Usage and example', target_url: 'https://docs.example/synopsis.html' }),
+    { label: 'Usage and example', url: 'https://docs.example/synopsis.html' },
+    'a dead click spends the target it aimed at',
+  )
+  assert.deepEqual(pathToSpend({ label: 'Back' }), { label: 'Back', url: null }, 'a url-less click spends its label')
+  assert.equal(pathToSpend(null), null, 'no action, nothing to spend')
+  assert.equal(
+    twins.candidates.filter((candidate) => !spentCrossRef(candidate)).length,
+    1,
+    'spending by target leaves the same-labelled twin on offer',
+  )
+
+  // The stable page, two dead candidates: the second step offers the one the
+  // first proved dead and not the first itself (the first is spent, above), and
+  // the round ends `no_progress` the moment the offerable set empties, inside
+  // `NO_PROGRESS_LIMIT`, whose count never got the chance to be the thing that
+  // ended it. The LinkedIn run is the same shape with a live second card instead
+  // of an exhausted list: three identical `click @40`, url unchanged, at step 4.
+  const twoDead = deadClicksStablePage(['Open the listing', 'See all jobs'])
+  assert.deepEqual(twoDead.picked, ['Open the listing', 'See all jobs'], 'the dead pick is not re-offered')
+  assert.equal(twoDead.reason, 'no_progress', 'exhaustion is a guard, not a `cannot_choose` decision')
+  assert.equal(twoDead.step, 3, 'and it ends when the offerable set empties, not on a retry over `none`')
+
+  // A page with more dead candidates than the limit is still bounded by the
+  // count, and never re-picks: three distinct targets, then the guard.
+  const manyDead = deadClicksStablePage(['a', 'b', 'c', 'd', 'e'])
+  assert.deepEqual(manyDead.picked, ['a', 'b', 'c'], 'a distinct target every step, never the same one twice')
+  assert.equal(manyDead.reason, 'no_progress', 'the limit ends a page with many dead candidates')
+
+  assert.equal(
+    deadEnd({ lastAction: null, candidates: [{ ref: '@1', label: 'x' }], spent: () => false }),
+    false,
+    'no action yet, no dead end',
+  )
+  assert.equal(
+    deadEnd({ lastAction: { label: 'x' }, candidates: [{ ref: '@1', label: 'x' }], spent: (candidate) => candidate.label === 'x' }),
+    true,
+    'the only candidate left is the one that just failed',
+  )
+  assert.equal(
+    deadEnd({ lastAction: { label: 'x' }, candidates: [{ ref: '@1', label: 'x' }], spent: () => false }),
+    false,
+    'and it is not a dead end while something unspent remains',
+  )
 
   // The request shaves the page before the questions.
   const questions = buildQuestions([{ ref: '@1', label: 'x'.repeat(200) }])
