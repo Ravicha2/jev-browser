@@ -103,6 +103,21 @@ export function pathToSpend(entry) {
   return { label: entry.label, url: entry.target_url ?? null }
 }
 
+// What a trace line adds about the offer (#30): the refs in the order Jev was
+// asked to rank them, and where in that order the pick landed. `candidates`
+// counts the list and the probabilities name its members, but neither says
+// which entry came first, so "was the pick inside the first 10" could not be
+// read off a run and the window question had no answer. Refs, not labels: the
+// labels ride in the request, and 64 of them per step would outweigh the rest
+// of the line. Omitted rather than zeroed, so a stop line stays short and a
+// pick at index 0 is a real 0.
+export function offerTrace(entry) {
+  return {
+    ...(entry.offered ? { offered: entry.offered } : {}),
+    ...(entry.picked_index == null ? {} : { picked_index: entry.picked_index }),
+  }
+}
+
 // Spend a path: the url when there is one, the label only as the fallback for
 // a url-less click; nothing at all for no path. One predicate, so a dead action
 // (#27) and a revisit (#11) retire a target by the same key.
@@ -798,6 +813,7 @@ async function main() {
       sy: entry.sy ?? null,
       page_changed: pageChanged(prevTracePoint, entry, PROGRESS_SY_EPSILON),
       candidates: entry.candidates,
+      ...offerTrace(entry),
       decision: entry.decision,
       ...(entry.label ? { label: entry.label } : {}),
       ...(entry.target_url ? { target_url: entry.target_url } : {}),
@@ -1034,6 +1050,11 @@ async function main() {
       fingerprint: observed.fingerprint,
       sy: observed.sy,
       candidates: candidates.length,
+      // The offer and where the pick landed in it (#30). Read off a run, these
+      // answer whether a pick sits near the top of the list or at the far end
+      // of it, which is the question the offer's shape turns on.
+      offered: candidates.map((candidate) => candidate.ref),
+      picked_index: decision.kind === 'click' ? decision.index : null,
       latency_ms: latencyMs,
       usage: response.usage ?? null,
       // The granted re-decision rides on the step's own record rather than as a
@@ -1815,6 +1836,21 @@ async function runSelfCheck() {
     { goal_met: 0.9, next_target: { choice: '@1', confidence: 0.8, probabilities: { '@1': 1 } } },
     'the trace carries the probabilities',
   )
+
+  // The offer and the pick's place in it (#30). Without both, a run says how
+  // long the list was and what was chosen but not whether the pick was near the
+  // top or at the far end, which is the whole window question.
+  assert.deepEqual(
+    offerTrace({ offered: ['@1', '@2', '@3'], picked_index: 1 }),
+    { offered: ['@1', '@2', '@3'], picked_index: 1 },
+    'the trace records the offer order and the picked index',
+  )
+  assert.deepEqual(
+    offerTrace({ offered: ['@1'], picked_index: 0 }),
+    { offered: ['@1'], picked_index: 0 },
+    'the first row is index 0, not a missing field',
+  )
+  assert.deepEqual(offerTrace({ decision: 'stop:step_budget' }), {}, 'a stop line has no offer to record')
 
   return Object.keys(asked).length
 }
