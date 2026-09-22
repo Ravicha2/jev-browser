@@ -156,6 +156,31 @@ export function progressAfter({ lastFingerprint, lastSy, noProgress }, { fingerp
   return { lastFingerprint: null, lastSy: null, noProgress: changed ? 0 : noProgress + 1 }
 }
 
+// The baseline an action leaves for the next step: where the action left the
+// page, which is what `progressAfter` compares against (#17). An action's own
+// movement is this loop's doing, not the page's — `reveal()` scrolls an
+// off-screen target into view before every click, the click then follows the
+// anchor's own href, and a read-scroll jumps a whole viewport — so a baseline
+// taken from the state the action started in is stale the moment it is written,
+// and the next step reads the loop's plumbing as the page having moved and
+// resets the no-progress pattern. That is the HN round clicking one `root` anchor
+// eight times (steps 4, 5, 8, 9, 11, 12) and ending on `step_budget` a step
+// before the count caught up.
+//
+// Reading the baseline after the whole action, rather than between its two
+// halves, is the point: the reveal leaves the page at 0 and the click that
+// follows scrolls it to the anchor's target, so a snapshot taken in between is
+// already stale against the step that comes next. The fingerprint is
+// scroll-stable by design (`pageFingerprint` hashes the url and the candidate
+// list, not the viewport), so `sy` is the whole correction and a read-scroll
+// that did reveal new candidates still changes the fingerprint and still counts.
+// `sy` is read on the cheap channel rather than by re-observing, because a
+// snapshot here would replace the ref map. `sy === null` is a position read that
+// failed: it leaves the previous baseline standing rather than inventing one.
+export function actedBaseline(progress, { fingerprint, sy }) {
+  return sy === null ? progress : { ...progress, lastFingerprint: fingerprint, lastSy: sy }
+}
+
 // The target to click is found in the snapshot taken immediately before the
 // click, and never carried over from the decision step. The label is the stable
 // key, not the index or the ref: the list order can shift with the page's
@@ -1022,8 +1047,13 @@ async function main() {
       await js(`window.scrollTo(0, ${to})`)
       pageScrolls.set(observed.fingerprint, scrolls + 1)
       recorded(`${revisitPending ? 'revisit-' : ''}scroll to ${to}`)
-      progress.lastFingerprint = observed.fingerprint
-      progress.lastSy = observed.sy
+      // The baseline is where the read left the page, not where it started
+      // (#17): the jump is ours, and a page shorter than the jump clamps below
+      // `to`, so read the position back.
+      progress = actedBaseline(progress, {
+        fingerprint: observed.fingerprint,
+        sy: await js('window.scrollY').catch(() => to),
+      })
       continue
     }
 
@@ -1077,6 +1107,16 @@ async function main() {
     }
     await wait(SETTLE_SECONDS)
 
+    // Read where the whole action left the page, reveal included (#17). The
+    // reveal scrolls the target into view and the click then follows the
+    // anchor's href, so `fresh` describes a page no later step will observe and
+    // a position read between the two halves describes one no later step will
+    // observe either. `window.scrollY` is what `pageInfo().sy` reports, and a
+    // failed read leaves the previous baseline standing. A click that threw
+    // moved nothing, and this same read reports that, so a dying click counts
+    // its way toward no_progress instead of resetting it.
+    const actedSy = await js('window.scrollY').catch(() => null)
+
     // Record the action before the next observation, so a stale post-action
     // snapshot cannot erase the record of something that did happen. The
     // target url rides along under its own name — `url` is the observed page
@@ -1093,11 +1133,10 @@ async function main() {
       },
     )
 
-    // The page this action was taken from, awaiting its post-action observation.
-    // Acting also refreshes the retry budget: "retry once, then escalate" is a
-    // rule about one decision, not about the whole run.
-    progress.lastFingerprint = fresh.fingerprint
-    progress.lastSy = fresh.sy
+    // The page this action left behind, awaiting its post-action observation
+    // (#17). Acting also refreshes the retry budget: "retry once, then
+    // escalate" is a rule about one decision, not about the whole run.
+    progress = actedBaseline(progress, { fingerprint: fresh.fingerprint, sy: actedSy })
     lastAction = { label: decision.label }
     retried = false
     spentUrls.clear()
@@ -1106,6 +1145,43 @@ async function main() {
 }
 
 // ------------------------------------------------------------------ self-check
+
+// One same-page anchor (`root`) clicked again and again on a page that still has
+// content below the fold, which is the HN shape of #17. All three things that
+// move the page are the loop's own doing: the bounded read-scroll jumps a
+// viewport, `reveal()` scrolls the anchor into view (measured on the live page:
+// an anchor above the fold lands the viewport at 0), and the click then follows
+// the anchor's href (measured: it lands on the anchor's target, and a repeat
+// click from there moves nothing). `baselineAfterAction` picks where the
+// baseline is read from, and the caller asserts which exit that buys.
+function anchorRepeat(fp, base, { baselineAfterAction }) {
+  const budget = 12 // the recorded run's own budget
+  const ANCHOR_LABEL = 'root'
+  const ANCHOR_SY = 300 // the anchor's target: where the click's href scroll lands the page
+  const VIEWPORT = 683 // one read-scroll
+  let run = { lastFingerprint: null, lastSy: null, noProgress: 0 }
+  let lastAction = null
+  let scrolls = 0
+  let position = 0
+  for (let step = 1; step <= budget + 1; step += 1) {
+    const observed = { fingerprint: fp, sy: position }
+    run = progressAfter(run, observed)
+    if (run.noProgress === 0) lastAction = null
+    const exit = preflight({ ...base, budget, step, noProgress: run.noProgress })
+    if (exit) return `${exit.reason} at step ${step}`
+    const deadRepeat = run.noProgress >= 1 && lastAction === ANCHOR_LABEL
+    if (shouldScrollPage({ stuck: deadRepeat, worthReading: 0.9, moreBelow: true, scrolls })) {
+      scrolls += 1
+      position = Math.round(observed.sy + VIEWPORT)
+      run = actedBaseline(run, { fingerprint: fp, sy: baselineAfterAction ? position : observed.sy })
+      continue
+    }
+    position = ANCHOR_SY // reveal(), then the href scroll, both before the baseline is read
+    run = actedBaseline(run, { fingerprint: fp, sy: baselineAfterAction ? position : observed.sy })
+    lastAction = ANCHOR_LABEL
+  }
+  return 'never exited'
+}
 
 async function runSelfCheck() {
   const assert = (await import('node:assert/strict')).default
@@ -1152,6 +1228,44 @@ async function runSelfCheck() {
     progressAfter({ lastFingerprint: fp, lastSy: 100, noProgress: 2 }, { fingerprint: fp, sy: 104 }).noProgress,
     3,
     'drift under the epsilon is not',
+  )
+
+  // Where the baseline is read is the whole defect (#17). Drive the loop's act
+  // path over the HN shape: one same-page anchor (`root`) clicked again and
+  // again, on a page the goal asks us to read that still has content below the
+  // fold. Three things move the page and all three are the loop's own doing:
+  // the bounded read-scroll jumps a viewport, `reveal()` scrolls the anchor into
+  // view (measured on the live page: an anchor above the fold lands the viewport
+  // at 0), and the click then follows the anchor's href (measured: it lands on
+  // the anchor's target, and a repeat click from there moves nothing). Reading
+  // the baseline after the reveal alone is not enough, because that href scroll
+  // happens after it.
+  //
+  // Read after the action, the count climbs one per step and `no_progress` fires
+  // inside `NO_PROGRESS_LIMIT` steps. Read before it, each of those jumps reads
+  // as the page having moved, the count resets, and the loop spends the whole
+  // budget re-clicking the dead anchor: the recorded run ended `step_budget` at
+  // step 13 having reached a count of 3 on the same step.
+  assert.equal(
+    anchorRepeat(fp, base, { baselineAfterAction: true }),
+    `no_progress at step ${NO_PROGRESS_LIMIT + 1}`,
+    'a repeated same-page anchor trips no_progress: the loop\'s own scrolls are not progress',
+  )
+  assert.equal(
+    anchorRepeat(fp, base, { baselineAfterAction: false }),
+    'step_budget at step 13',
+    'the pre-action baseline spends the budget instead: the recorded run, step for step',
+  )
+  // The correction itself, so a failure names the field that is wrong.
+  assert.deepEqual(
+    actedBaseline({ lastFingerprint: null, lastSy: null, noProgress: 2 }, { fingerprint: fp, sy: 299.5 }),
+    { lastFingerprint: fp, lastSy: 299.5, noProgress: 2 },
+    'the position the action left is the baseline, and the count rides along',
+  )
+  assert.deepEqual(
+    actedBaseline({ lastFingerprint: fp, lastSy: 299.5, noProgress: 2 }, { fingerprint: fp, sy: null }),
+    { lastFingerprint: fp, lastSy: 299.5, noProgress: 2 },
+    'a failed position read leaves the previous baseline standing',
   )
 
   // The click target comes from the act-time snapshot, never from decision

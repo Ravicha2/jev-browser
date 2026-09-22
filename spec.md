@@ -212,10 +212,24 @@ fingerprint across rounds.
 
 Observable change is the fingerprint **or** the scroll position. The fingerprint is
 deliberately scroll-stable (fragment-free URL, sorted `label|count` pairs), because the loop
-scrolls on purpose and the repeat-page guard must not fire on every scroll — so an in-page
-anchor jump or a read-scroll counts on `pageInfo().sy` instead, above a small drift epsilon so
-a sticky header cannot fake progress forever. An in-page anchor click is how a docs site works;
-that is why it counts as progress rather than as a dead action.
+scrolls on purpose and the repeat-page guard must not fire on every scroll — so a scroll the
+loop did not cause counts on `pageInfo().sy` instead, above a small drift epsilon so a sticky
+header cannot fake progress forever.
+
+The baseline is read **after** the action, never before it (#17). Three things move the page
+and all three are the loop's own doing: `reveal()` scrolls an off-screen target into view before
+every click, the click then follows the anchor's own href, and a read-scroll jumps a whole
+viewport. A baseline taken from the pre-action observation therefore describes a page the next
+step will never see, and every one of those jumps reads as the page having moved and resets the
+count. That is how the HN round clicked one `root` anchor at steps 4, 5, 8, 9, 11 and 12 and
+ended on `step_budget` with the count already at 3.
+
+The baseline costs a real signal, and this is the trade: a click that only scrolls an
+already-loaded page to an anchor — a docs site's table of contents — moves the viewport without
+changing the fingerprint, so it no longer counts as progress either. Three of those in a row end
+the round as `no_progress`; the per-page read-scroll limit bounds the same shape for scrolling.
+What the counter now measures is content the loop had not seen, not viewport position the loop
+produced itself.
 
 A return to a decided page is a **revisit**, not a stall (#10, refined in #11). The repeat-page
 guard grants one re-decision per fingerprint, spends the outbound and inbound paths **by target
