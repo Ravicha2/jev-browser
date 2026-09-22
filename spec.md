@@ -231,6 +231,27 @@ the round as `no_progress`; the per-page read-scroll limit bounds the same shape
 What the counter now measures is content the loop had not seen, not viewport position the loop
 produced itself.
 
+A dead action spends its own target before the next decision (#27). A click that changed
+nothing is the one signal the loop has that the pick was right about the **content** and
+wrong about the **state**: LinkedIn's guest jobs search pre-renders the `currentJobId` card
+in the detail panel beside the list, so the card for the job already shown is a no-op click,
+and Jev, stateless between steps, names that same card again because nothing on the page
+said otherwise. Nothing the loop already had breaks the tie: the page is never left, so it
+never enters `visited`, so `repeat_page` never fires, so nothing is ever spent, and the round
+ends `no_progress` after three identical clicks that each had a live alternative beside them.
+
+So the target is spent by the same key a revisit spends by (the target url, with the label
+only as the url-less fallback), and the next ask excludes it. The spend is one action deep:
+the next click clears the spent sets, and a dead action there spends its own target in turn,
+so each dead action retires exactly what it proved dead. Spending is **unchanged fingerprint
+only**: a page that changed but did not advance is the progress signal the loop already has,
+and blaming the pick for it would spend a target that may still be the way forward.
+
+When the offerable set empties, the round ends `no_progress`, not `cannot_choose`: the loop
+acted and nothing moved, which is what that reason already means, and the alternative sends
+Jev a list holding one `none`. `NO_PROGRESS_LIMIT` still bounds a page with many dead
+candidates, so a 66-card listing does not pay 66 asks to prove the same thing.
+
 A return to a decided page is a **revisit**, not a stall (#10, refined in #11). The repeat-page
 guard grants one re-decision per fingerprint, spends the outbound and inbound paths **by target
 url, not label** — twins share a label, and label-keyed spending deleted the real section anchor
