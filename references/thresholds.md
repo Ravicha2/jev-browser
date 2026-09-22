@@ -480,3 +480,85 @@ the candidate whose label names the *field* over the one that names an *adjacent
 
 The cost, unchanged in kind: input tokens ~320k per run (bigger lists, more grounding per
 ask), ~$0.013 per task at $0.042/Mtok. Still not a constraint.
+
+## The offer's shape (#30): what a row carries
+
+The offer is what `next_target` ranks, so its shape is a tunable of the same kind as the
+candidate cap — it changes how much list Jev has to hold at once, not whether it can answer.
+#30's prerequisite was measurement: the trace recorded the candidate count but neither the
+offer order nor where the pick landed, so "was the pick inside the first W" had no answer.
+`offerTrace()` now writes `offered` (the refs in order) and `picked_index`, and every reading
+below comes off those fields rather than off a guess.
+
+### The measurement
+
+Guest LinkedIn job search, `https://www.linkedin.com/jobs/search/?currentJobId=...&keywords=AI`,
+goal `open the first job listing in this LinkedIn search results list so its details are
+shown`, `step_budget` 6, `jev-1.13.0` every step. Runs under `~/.claude/jev-browser/runs/`,
+2026-09-22, two windows: 11:50-11:51 (flat offer), 11:55-12:00 (numbered and numbered+state).
+Each window is its own control, because the guest page drifts between renders (22, 27, 63, 65,
+67, 69, 79 and 112 candidates have all been observed on this url in one afternoon).
+
+| Arm | runs | steps | next_target answers | median confidence | < 0.5 | picks, index in the offer |
+|---|---|---|---|---|---|---|
+| flat, 11:50 window | 5 | 30 | 28 | 0.60 | 8/28 | 14, 22, 46 (all on the named row) |
+| flat, 11:56 window | 3 | 11 | 11 | 0.44 | 7/11 | 14, 22 |
+| flat, already-open scenario | 3 | 10 | 10 | 0.49 | 6/10 | 14, 18, 22, 46 |
+| numbered + state, 11:55 | 5 | 12 | 12 | 0.44 | 10/12 | 14, 22 |
+| numbered + state, already-open | 2 | 5 | 5 | 0.52 | 2/5 | 47 (the tracking twin) |
+| numbered, no state | 2 | 4 | 4 | 0.38 | 4/4 | none reached a click |
+| numbered + state, unambiguous goal | 3 | 10 | 10 | 0.53 | 5/10 | 18, 32, 50 |
+
+Three readings, in the order they matter.
+
+1. **Where the pick lands.** 0 of 19 picks on the flat offer fell inside the first 10, 5
+   inside the first 15 (all at index 14, the 22-candidate hydration step), 15 inside the first
+  25. The destination itself — the first job listing — is row 23 of 65, behind 21 chrome rows
+   (skip links, the search form, five filter buttons, an alert CTA, two jump buttons). So a
+   positional window is the wrong fix, exactly as #30's caution predicted: a first-10 or
+   first-15 window deletes the destination. This is the reading shape 1 was chosen from.
+2. **What the pick was.** Every flat pick landed on the named entry anyway (index 22 = row 23).
+   The model was not picking wrong; it was picking right with 0.5 mass among near-identical job
+   titles. Numbering changed nothing there, and the same-request control says why: an
+   unambiguous goal on the same 65-row offer — `open the job listing titled 'Computational
+   Biologist - AI Trainer'` — scored **0.95** on its first ask, against 0.44 to 0.65 for the
+   positional one. The mass is thin because the rows are alike, not because the list is long.
+3. **What the state half bought.** In the already-open scenario (start_url pinned to a job that
+   renders first, so its card is `current`), the marked row was the argmax in all three flat
+   rounds (0.47, 0.51, 0.51) and a non-contender in both numbered rounds (0.19, 0.18, 0.11):
+   the pick moved off the already-open card, which is what #27 spends a step to achieve after
+   the fact. The state mark is therefore the half that earns its keep, and it is the half that
+   makes the offer's answer *proactive* rather than corrective.
+
+4. **Landing is not finishing.** Every positional round that got a click away landed the named
+   entry (`picked_index` 22 in all of them), and the click navigates: in
+   `.../runs/2026-09-22T11-51-12-551Z-open-the-first-job-listing-in-this-linke` step 2 lands
+   `/jobs/view/4469156162/`, the first listing's details. No positional round reached `done`
+   anyway, because `goal_met` on that page read 0.21 to 0.36 against its 0.8 bar while the
+   details panel was visibly open. Shape 1 therefore fixes the offer, not the finish, and the
+   finish is the next measurement this page wants.
+
+### The cost
+
+| | |
+|---|---|
+| Extra requests | none. State and position travel inside text the request already carried. |
+| Extra tokens | the position prefix and `(state)` are ~5 characters per row, ~0.3k input per step on a 65-row offer, against ~7.4k per step for the list and page. Under 5%. |
+| Extra browser work | one `js()` per observation, in-page, no navigation. Latency is noise against `SETTLE_SECONDS` and the ask. |
+| Tokens observed | flat arm 197.5k in / 19.1k out over 30 steps; numbered+state arm 89.2k in / 8.3k out over 12 steps (the arms differ in length, not in per-step cost). |
+| Code | `offerRow()` and `stateMarks()` in `explore.js`, ~60 lines with comments; no change to `prune.js`. |
+
+### The tunables this touches, and the one it does not
+
+- `NEXT_TARGET_CONFIDENCE` (0.5) is **not** re-expressed as a margin over the runner-up. #30's
+  working view holds: the 0.44 to 0.79 readings on the same list over one afternoon show a gate
+  that is not mis-scaled, it is measuring a genuinely ambiguous ranking. Reading 2 above is the
+  evidence — the gate fires on a *correct* pick, so a margin would not have saved it either.
+- `PROBABILITY_SUM_TOLERANCE` and the argmax rule are what turned one ambiguous round into
+  `invalid_response` (a tie at 0.40/0.40): unchanged, and reading 2 says the answer is to make
+  the ask easier or the goal sharper, not to loosen validation.
+- `MAX_CANDIDATES` (120) and `SHORT_CANDIDATES` (60) are untouched. This offer is 65 to 112
+  entries and never hits either.
+- The next lever this measurement points at is not an offer shape at all: it is the gate.
+  A pick with correct content and 0.5 mass is a threshold problem, and #30 parked that
+  decision deliberately.

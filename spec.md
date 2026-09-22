@@ -163,6 +163,14 @@ removing commit-like controls from the candidate list before Jev sees it.
 **5. One request per step, several speculative questions in it.** Output tokens are free and
 questions run in parallel, so ask for branches we may not take and read only the one we need.
 
+**6. The offer is what Jev is actually shown, so its shape is a design surface (#30).** A row
+carries its position in the offer and, when the page has one, its state — `(current)`,
+`(selected)`, `(expanded)`. Decision 1 says Jev is the relevance judge rather than the click
+dispatcher; this is the part of that judgment the offer itself can make easier or harder. Both
+facts ride in the row's text rather than as a second field per candidate: `criteria` is a flat
+`{ref: text}` map, and prefixing a string is a smaller change than widening the protocol. See
+"The offer's shape" under Candidate pruning for what was measured and what it cost.
+
 ## The step loop
 
 One heredoc per round. Loop inside it, print one JSON object, exit.
@@ -252,6 +260,20 @@ acted and nothing moved, which is what that reason already means, and the altern
 Jev a list holding one `none`. `NO_PROGRESS_LIMIT` still bounds a page with many dead
 candidates, so a 66-card listing does not pay 66 asks to prove the same thing.
 
+**Row state does not retire that spend (#30).** The state mark (below) removes the *cause* in
+the case #27 was written for: the already-open card is now labelled `(current)` before the ask,
+so the pick stops landing on it (0.47/0.51/0.51 flat against 0.19/0.18/0.11 marked, measured
+2026-09-22) instead of spending a step to find that out. It is still not redundant, on the two
+shapes #27 already covers and the state mark cannot see: the **tracking twin** is the same job
+under a different href (`?eBP=` against `?alternateChannel=search`), so it is not the element
+the state query marks and it still takes the pick in the marked arm; and a page that
+**re-renders while it loads** resets the fingerprint every step, so nothing accumulates and
+only the spend bounds the repetition. Both are `no_progress`-shape failures, so `no_progress`,
+`NO_PROGRESS_LIMIT`, `repeat_page`/`REVISIT_LIMIT`, `ping_pong`, `step_budget`,
+`only_commit_remains`, `start_url_mismatch` and `stale_page` all keep their live triggers.
+Nothing in the guard set becomes dead code; the state mark makes one guard fire earlier, not
+less often.
+
 A return to a decided page is a **revisit**, not a stall (#10, refined in #11). The repeat-page
 guard grants one re-decision per fingerprint, spends the outbound and inbound paths **by target
 url, not label** — twins share a label, and label-keyed spending deleted the real section anchor
@@ -298,6 +320,68 @@ things (icon buttons, JS-driven buttons with a friendly `aria-label`). That is w
 degrades safely: when the pruned list is empty or *only* commit-like candidates remain, the
 loop stops and escalates rather than guessing.
 
+### The offer's shape (#30)
+
+The pruning above decides *which* candidates are offered. This decides how the offer reads,
+because on a page like a job search the list is 64 to 73 entries and the ranking ask is the
+step's most expensive judgment. Two facts were missing from a row, and both now ride in the
+row's text (decision 6):
+
+- **Position.** `offerRow()` numbers each row by its index in the offer. Before this, nothing
+  in the offer said which entry came first, so a goal naming a position could only be answered
+  by plausibility. Measured on the guest LinkedIn search page: the entry a positional goal
+  names — the first job listing — is row 23 of 65, behind 21 chrome rows (skip links, the
+  search form, five filter buttons, an alert CTA, two jump buttons). A "first N window" is
+  therefore the wrong fix, and this is the measurement that says so: 0 of 19 picks in the
+  rounds on record fell inside the first 10, and the destination is at 23.
+- **State.** The accessibility tree annotates a node with `ref`, `loc` and `url` and nothing
+  else — measured, zero state lines in a 658-line tree — so a control that is already open or
+  already selected looked exactly like one that was not. `stateMarks()` reads `aria-current`,
+  `aria-selected` and `aria-expanded` off the element each candidate's `loc` names, walking up
+  to four ancestors because LinkedIn marks the card's wrapper rather than the anchor. Marked
+  rows read `23. Engineer | AI Assurance (current)`.
+
+The cost is one DOM query per observation and no extra request: state travels inside text that
+was already being sent, so token cost is a few characters per candidate, and the query is
+in-page with no latency budget of its own. The candidate object keeps its bare label —
+the trail, the spend key and `resolveTarget` all outlive the step and compare against it — so
+the numbered text exists only in the request.
+
+**What it did and did not buy** (runs in `~/.claude/jev-browser/runs/`, 2026-09-22):
+the state half did what it was for. In the already-open-card scenario the marked row fell from
+the argmax in all three flat rounds (0.47, 0.51, 0.51) to a non-contender in both numbered
+rounds (0.19, 0.18, 0.11), and the pick moved to a different row. The position half did not
+move the pick or the confidence: the model already landed on the named entry from the labels
+alone, in both shapes. It did have one measured side effect — a chrome control whose text
+shares the goal's words ("Try AI job search", row 21 of 65) rose from ~0.10 to ~0.35 in seven
+numbered rounds against eleven flat ones where it stayed at or below 0.14. That is one decoy
+row on one page, so it is recorded as a risk rather than a reason to drop the numbering, but
+the next page measured should check it.
+
+**A positional goal lands the named entry, and still does not finish.** In every flat round
+that got a click away, the pick was the same row: offer index 22, which is the first job
+listing, at row 23 of 65. In
+`.../runs/2026-09-22T11-51-12-551Z-open-the-first-job-listing-in-this-linke` the step 2 click
+navigates to `/jobs/view/4469156162/` — the first listing's details, which is what the goal
+asked for — and the round then spends its remaining steps on the card that is now already open
+and on the tracking twin, exiting `step_budget` at step 7. `goal_met` reads 0.21, 0.28, 0.30,
+0.34 across those steps and never approaches 0.8, so the goal is met on the page and unmet in
+the reading. That is not a position defect and not an offer-shape defect; it is the next thing
+to measure on this page, and it is why the positional rounds are recorded as landing the entry
+rather than as finishing it.
+
+What the offer shape is *not* is the binding constraint on that page, and the measurement says
+why. On the same 65-row offer, a goal with an unambiguous destination ("open the job listing
+titled 'Computational Biologist - AI Trainer'") scored 0.95 on its first ask, while the
+positional goal scored 0.44 to 0.65. The argmax is thin because the rows are near-identical
+job titles, not because the list is long: the model's choice was right and its confidence was
+honest. Region heads (shape 2 of #30) would not change that, and the gate question that
+`NEXT_TARGET_CONFIDENCE` really is stays open where #30 parked it.
+
+The two decisions #30 left contingent on shape 2 stay unmade for the same reason: shape 2 was
+not built, so there is no `done` question for it to answer, and cutting the offer by page
+region is not attempted. What was built is the smaller change the measurement supported.
+
 ## Questions per step
 
 Exploratory collection. `state` carries `goal`, the pruned `candidates`, and a short `trail`
@@ -306,10 +390,13 @@ of what has been visited already.
 ```js
 questions = {
   // Content relevance: which result is worth opening. Jev's strength.
+  // Each row is numbered by its position in the offer and carries its state
+  // (#30), so "the first job listing" and "the panel that is already open" are
+  // answerable from the offer itself.
   next_target: {
     type: 'choice',
-    instructions: 'Which candidate is most likely to lead toward `goal`? Choose `none` if none does.',
-    criteria: { ...candidates.map(c => [c.ref, c.label]), none: 'None of these leads toward the goal' },
+    instructions: 'Which candidate is most likely to lead toward `goal`? Each row is numbered by its position in the list, and a row marked (current), (selected) or (expanded) is already open. Choose `none` if none does.',
+    criteria: { ...offered.map(row => [row.ref, row.label]), none: 'None of these leads toward the goal' },
   },
 
   // Termination.
