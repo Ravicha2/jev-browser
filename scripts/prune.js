@@ -2,8 +2,10 @@
 // pruning").
 //
 // Runs in code before every Jev call. It is both the main accuracy lever and the
-// safety control: step 7 removes commit-like controls before Jev ever sees the
-// list, so submitting is unreachable rather than discouraged.
+// safety control: step 8 tags commit-like controls instead of removing them
+// (#18), so Jev sees the whole page and may name one, and the loop returns that
+// name for the caller's authorization rather than clicking it. Removing them
+// made submitting unreachable; the tag makes it authorized.
 //
 // M1 (#4) measured the old rule — drop off-viewport nodes — deleting the
 // destination on nearly every task: a collection agent is sent to find facts
@@ -51,8 +53,9 @@ const LABEL_FROM_SIBLING_ROLES = new Set([
 const MAX_LABEL_CHARS = 120
 const MAX_CANDIDATES = 120
 
-// Step 7's denylist. A denylist misses things (icon buttons, friendly
-// aria-labels); that is why the policy degrades safely instead of trusting it.
+// Step 8's denylist. A denylist misses things (icon buttons, friendly
+// aria-labels); that is why the policy does not rest on it — the click waits for
+// the caller's authorization (#18), and the filter only decides what gets marked.
 const COMMIT_WORDS = [
   'submit', 'send', 'post', 'publish', 'pay', 'buy', 'checkout', 'confirm',
   'delete', 'remove', 'cancel order', 'unsubscribe',
@@ -89,7 +92,7 @@ export function parseSnapshot(snapshotText) {
   return lines
 }
 
-// Steps 1 through 7 of spec order (the commit filter is step 8).
+// Steps 1 through 8 of spec order (step 8 is the commit tag, not a filter).
 //
 // visibleRefs is the hint: the refs the loop measured inside the viewport. It
 // changes nothing about membership — a candidate below the fold is still
@@ -101,9 +104,11 @@ export function pruneCandidates(snapshotText, options) {
   return pruneDetail(snapshotText, options).candidates
 }
 
-// The same pipeline, plus two numbers the loop branches on. commitCount: an
-// empty list means "nothing to click", but an empty list that step 7 emptied
-// means "only commit-like controls remain", which is its own exit.
+// The same pipeline, plus two numbers the loop branches on. commitCount: how
+// much of the offer is commit-like — the tag, not a removal (#18), so an empty
+// list is simply "nothing to click" whatever the count says and the count is
+// what tells a reader (and the fixture check) how many controls wait on the
+// caller's authorization.
 // offscreenCount: how many offered candidates sit below the fold right now.
 //
 // currentUrl drops self-referential anchors: a candidate whose url is exactly
@@ -160,9 +165,9 @@ export function pruneDetail(snapshotText, { visibleRefs = [], currentUrl = null 
     else unique.set(key, { ...candidate, count: 1 })
   }
 
-  // 5. truncate, 6. cap with same-page seats first, 7. the trust boundary
-  // follows in `allowed`. Only ref, label and count go to Jev; loc, the raw
-  // texts and the url were for matching and spending, not for sending.
+  // 5. truncate, 6. cap with same-page seats first, then 7. the commit tag. Only
+  // ref, label, count and the tag go to Jev; loc, the raw texts and the url were
+  // for matching and spending, not for sending.
   //
   // The cap's order (#11, task 3 of the M1 re-run): measured on nodejs.org's
   // cli.html the full tree yields more uniques than the cap keeps, and a blind
@@ -181,16 +186,23 @@ export function pruneDetail(snapshotText, { visibleRefs = [], currentUrl = null 
     ;(same ? ownPage : crossPage).push(candidate)
   }
   const capped = [...ownPage, ...crossPage].slice(0, MAX_CANDIDATES)
-  const allowed = capped.filter((candidate) => !isCommitLike(candidate))
-  const candidates = allowed.map((candidate) => ({
+  // 8. Tag, do not remove (#18). A commit-like control keeps its seat and rides
+  // out marked, so the model may name it — and naming it is not clicking it: the
+  // loop returns the pick as an authorization exit and clicks it only when the
+  // caller supplies it on the next round. Removing it made the end of a route
+  // unreachable; the tag makes it authorized. The mark is a fact about the
+  // control, read by code here and rendered into the offer row.
+  for (const candidate of capped) if (isCommitLike(candidate)) candidate.commitLike = true
+  const candidates = capped.map((candidate) => ({
     ref: candidate.ref,
     label: truncate(candidate.label),
     count: candidate.count,
     ...(candidate.url ? { url: candidate.url } : {}),
+    ...(candidate.commitLike ? { commitLike: true } : {}),
   }))
   return {
     candidates,
-    commitCount: capped.length - allowed.length,
+    commitCount: candidates.filter((candidate) => candidate.commitLike).length,
     offscreenCount: candidates.filter((candidate) => !visible.has(candidate.ref.slice(1))).length,
   }
 }
@@ -244,15 +256,14 @@ async function selfCheck() {
   const candidates = detail.candidates
   const labels = candidates.map((candidate) => candidate.label)
 
-  // The loop's empty-list distinction: 4 controls were removed by the filter.
-  assert.equal(detail.commitCount, 4)
-
-  // Trust boundary, unchanged by the viewport fix: the submit button (an
-  // input[type=submit] wearing its text), the "Send" link, the "Buy now"
-  // button, the unsubscribe link. Widening what is offered never widens what
-  // is allowed.
-  for (const gone of ['Submit', 'Buy now', 'Send', 'Unsubscribe from all emails']) {
-    assert.ok(!labels.some((label) => label.includes(gone)), `${gone} reached Jev`)
+  // The commit tag (#18): 4 controls are commit-like, they keep their seats, and
+  // they ride out marked. Naming one is not clicking one — the loop turns a
+  // marked pick into an authorization exit (explore.js checks that half).
+  assert.equal(detail.commitCount, 4, 'the four commit-like controls are counted')
+  for (const marked of ['Submit', 'Buy now', 'Send', 'Unsubscribe from all emails']) {
+    const candidate = candidates.find((entry) => entry.label.includes(marked))
+    assert.ok(candidate, `${marked} left the offer`)
+    assert.equal(candidate.commitLike, true, `${marked} is offered unmarked`)
   }
 
   // The reachability fix itself: a below-the-fold node is offered, counted as
@@ -306,11 +317,12 @@ async function selfCheck() {
   assert.ok(!elsewhere.some((candidate) => candidate.ref === '@27'), 'the no-op ref is gone')
 
   // Truncation, and the cap. 150 unique label|url pairs -> 120 kept in DOM
-  // order (the second "Read more" takes a seat, so the cutoff moves back one)
-  // -> 4 commit controls removed.
+  // order (the second "Read more" takes a seat, so the cutoff moves back one).
+  // Nothing is removed after the cap any more; the 4 commit-like entries keep
+  // the seats they always had and are marked in place (#18).
   const long = candidates.find((candidate) => candidate.label.endsWith('…'))
   assert.ok(long && long.label.length === MAX_LABEL_CHARS, 'long label not truncated to 120')
-  assert.equal(candidates.length, 116, 'cap: 150 entries -> 120 -> 4 commit controls removed')
+  assert.equal(candidates.length, 120, 'cap: 150 entries -> 120, commit-like included')
   assert.ok(labels.includes('Result 110') && !labels.includes('Result 111'), 'cap kept the wrong entries')
   assert.ok(candidates.length <= MAX_CANDIDATES)
 

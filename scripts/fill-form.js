@@ -26,8 +26,10 @@
 //
 // Submitting is unreachable, not discouraged — and this loop goes one further:
 // it never clicks anything at all, so no commit-like control can be clicked
-// whatever its label. The commit filter (#2) still prunes upstream, and the
-// self-check asserts this file's own source contains no click.
+// whatever its label. Since #18 prune.js tags commit-like controls instead of
+// removing them, so they are in the field list's source; this loop's own rules
+// are what keeps them out of the fields (a submit button is a `button`, never a
+// textbox) and the self-check asserts this file's own source contains no click.
 //
 // Run:   cat scripts/prune.js scripts/ledger.js scripts/fill-form.js | ego-browser nodejs
 // Check: node scripts/fill-form.js      (guards and the decider, no browser)
@@ -137,10 +139,11 @@ export function rolesOf(snapshotText, parse = parseSnapshot) {
   return roles
 }
 
-// The fields Jev is asked about: the pruned candidates — so the commit filter,
-// the label rule and the dedupe all still apply — narrowed to the roles code
-// can fillInput. A submit button is a `button`, never a textbox, so the trust
-// boundary holds twice over.
+// The fields Jev is asked about: the pruned candidates — so the label rule and
+// the dedupe still apply, and the commit-like ones are among them since #18 —
+// narrowed to the roles code can fillInput. A submit button is a `button`, never
+// a textbox, so the trust boundary holds twice over: the explore loop would ask
+// the caller before clicking a tagged control, and this loop never clicks at all.
 export function fillableFields(candidates, roles) {
   return candidates
     .filter((candidate) => FILLABLE_ROLES.has(roles.get(candidate.ref.slice(1))))
@@ -892,19 +895,28 @@ async function runSelfCheck() {
   // The fixture form has a visible submit button, a "Buy now", a "Send" and an
   // unsubscribe link. Exactly one fillable field survives: the labelled VAT
   // textbox. The label-less searchbox (@31) is dropped by prune's label rule,
-  // and the four commit-like controls never reach the list at all.
+  // and the four commit-like controls are offered and tagged since #18 — the
+  // explore loop asks the caller before clicking a tagged one, and this loop
+  // clicks nothing at all, so neither loop can reach a commit on this form.
   const fixture = fs.readFileSync(new URL('./fixtures/snapshot.txt', import.meta.url), 'utf8')
   const detail = prune.pruneDetail(fixture, {})
   const fields = fillableFields(detail.candidates, rolesOf(fixture, prune.parseSnapshot))
   assert.deepEqual(fields, [{ ref: '@20', label: 'VAT number' }], 'the fixture form has one fillable field')
   assert.ok(!fields.some((field) => field.ref === '@21'), 'the submit button is not a field')
 
-  // The structural guarantee of this cut: the loop never clicks anything, so no
-  // commit-like control can ever be clicked, whatever its label. Checked
-  // against this file's own source.
+  // The guarantee that replaced "no commit-like control can be clicked": no
+  // commit-like pick is clicked — here because the loop clicks nothing, and in
+  // explore.js because a tagged pick comes back for authorization first. The
+  // tag is upstream of both, so the controls are in the list this narrows.
   const source = fs.readFileSync(new URL(import.meta.url), 'utf8')
   assert.ok(!/(?<![A-Za-z])click\(/.test(source), 'the fill loop contains a click')
-  assert.equal(detail.commitCount, 4, 'the commit filter still fired upstream')
+  assert.equal(detail.commitCount, 4, 'the four commit-like controls are tagged upstream')
+  assert.equal(
+    detail.candidates.find((candidate) => candidate.ref === '@21')?.commitLike,
+    true,
+    'the submit button is offered marked, not removed',
+  )
+  assert.ok(!fields.some((field) => field.commitLike), 'no tagged control is a fillable field')
 
   // The shell guarantee (#7): nothing travels through a shell, so a goal with
   // quotes, backticks, or newlines cannot break the invocation. The only way
