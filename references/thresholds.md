@@ -165,7 +165,7 @@ they are not evidence-backed, and saying so is the point of the table.
 |---|---|---|---|
 | `MODEL` | `jev-latest` | An alias moves under you; a pin is reproducible but needs manual bumps. | Resolved to `jev-1.13.0` in every step of all three runs. **Not pinned yet**: the issue pins it once the thresholds are set, and this gate is a no-go. |
 | `GOAL_MET` | 0.8 | Lower exits `done` on a half-answer; higher burns steps then escalates. | Fired once, on task 7, and correctly: the two-clicks-in, `done`-out round is the shape the threshold is for. One data point is not a calibration. |
-| `NEXT_TARGET_CONFIDENCE` | 0.5 | Higher rejects more picks into the retry; lower turns shaky picks into clicks. | **The most-fired threshold.** The retry path was entered 35 times across 132 steps: 15 times on `low_confidence` in the two runs that kept trails, and 11 retries in the first run. Almost every firing was on a list missing its destination, so lowering it would only produce more confident self-clicks. Leave it. |
+| `NEXT_TARGET_CONFIDENCE` | 0.5 | Higher rejects more picks into the retry; lower turns shaky picks into clicks. | **The most-fired threshold.** The retry path was entered 35 times across 132 steps: 15 times on `low_confidence` in the two runs that kept trails, and 11 retries in the first run. Almost every firing was on a list missing its destination, so lowering it would only produce more confident self-clicks. Leave it. (#30 later measured the other regime: the destination present and the pick correct, mass still thin, so the same firing reads differently — the click-and-observe arm at the bottom of this file is the pending test of it.) |
 | `CREDENTIAL_NOUL` | 0.7 | Lower hands off on a page that merely looks gated. | Never fired: no goal needed a login. No evidence. |
 | `CANNOT_CHOOSE_NOUL` | 0.6 | Lower escalates on a merely-difficult page; higher forces a pick. | Fired 9 times across 30 task-runs, and in every case the list genuinely lacked the answer. Correct, and it is the guard that keeps this defect from turning into a misclick. |
 | `ONLY_COMMIT_NOUL` | 0.5 | Lower escalates on pages with any commit-like control. | Never fired. No evidence. |
@@ -560,5 +560,28 @@ Three readings, in the order they matter.
 - `MAX_CANDIDATES` (120) and `SHORT_CANDIDATES` (60) are untouched. This offer is 65 to 112
   entries and never hits either.
 - The next lever this measurement points at is not an offer shape at all: it is the gate.
-  A pick with correct content and 0.5 mass is a threshold problem, and #30 parked that
-  decision deliberately.
+  A pick with correct content and 0.5 mass is a threshold problem, which is the next arm:
+
+### The next arm this points at: click-and-observe below the bar
+
+The design pass over this measurement records the option that follows from reading 2, and the
+margin re-expression stays rejected with it.
+
+- **The asymmetry.** An escalate ends the round. Session 2 spent 326,070 input tokens over nine
+  LinkedIn rounds (about 36k each), four of them dead before a guard mattered. A wrong
+  non-commit click costs one or two steps of a 6 to 12 step budget and is policed by machinery
+  that already exists: #27's dead-action spend, the revisit continue, `no_progress` with the
+  `sy` epsilon.
+- **The premise.** Every offered candidate is reversible because step 8 removes commit-like
+  controls upstream of the offer, and only as strongly as that filter's pattern set
+  (`COMMIT_TEXT`, `BARE_RIGHT_ARROW`, `SUBMIT_INPUT`) — a heuristic, not a proof. Tagging
+  instead of removing is #18's design; removing the filter outright would revisit this.
+- **The control the arm needs, from these runs.** The one retry is not dead weight: in
+  `.../runs/2026-09-22T11-51-12-551Z-...` step 4 retried at 0.45 and the re-ask came back at
+  0.50, which cleared the bar and clicked. So the arm has to beat retry-then-click, not just
+  beat retry.
+- **Where it would run.** The same 64 to 73 candidate page and the same m1 goals, per the
+  design pass. Not measured here.
+
+If the arm wins, `NEXT_TARGET_CONFIDENCE` stops being the checkpoint for navigation and stays
+what it is measurably good at: the trigger for the one retry before the posterior takes over.

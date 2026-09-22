@@ -451,7 +451,7 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 | `has_answer.noul` | >= 0.7 | the extraction ask's chosen span is copied into the ledger as a finding |
 | `has_answer.noul` | >= 0.35, < 0.7 | the chosen span is copied with `tentative: true`: the model named a line its own `has_answer` did not back, and the round would otherwise end with an empty ledger |
 | `has_answer.noul` | < 0.35 | the cookbook's absent band: no entry. A firing `goal_met` on a page this low is a disagreement the trace records. |
-| `next_target.confidence` | < 0.5 | retry once over the same list, then escalate |
+| `next_target.confidence` | < 0.5 | retry once over the same list, then escalate. Open: a measured click-and-observe arm, below |
 | `needs_credential.noul` | > 0.7 | `handOffTaskSpace`, exit escalate |
 | `cannot_choose.noul` | > 0.6 | scroll if worth reading and unread below, retry once, then escalate |
 | `worth_reading.noul` | > 0.5 | with a retry pending, or a granted revisit (#11): scroll one viewport before spending it, max 3 per page |
@@ -460,6 +460,24 @@ Thresholds start here and get tuned on our own pages, not treated as rules:
 
 A malformed `choice` answer gets the same one retry before escalating as `invalid_response`,
 so a self-disagreeing answer costs a re-ask rather than a round.
+
+**The confidence gate is a checkpoint against a reversible action (#30, widened).** The #30
+measurement rejected the margin re-expression (a margin would not have saved a correct pick at
+0.5), and the design pass over it adds the option that follows from the same evidence: a sub-bar
+pick on a **reversible** target becomes click-and-observe — click it, let the posterior guards
+judge the landing — as a measured arm against the retry/escalate path. The asymmetry is the
+argument: an escalate ends the round (session 2: 326,070 input tokens over nine LinkedIn rounds,
+about 36k each, four dead before a guard mattered), while a wrong non-commit click costs one or
+two steps of a 6 to 12 step budget and is already policed by the dead-action spend, revisit
+continue and `no_progress`. The premise is that every offered click is reversible, which holds
+because step 8 removes commit-like controls upstream of the offer — and holds only as strongly
+as that filter's pattern set (`COMMIT_TEXT`, `BARE_RIGHT_ARROW`, `SUBMIT_INPUT`), which is a
+heuristic, not a proof. That is why removing the filter outright rather than **tagging** it
+(the design in #18: a commit-like pick returns as an authorization exit, never a click) would
+revisit this decision. Not built here: it needs its own measured arm, on the same 64 to 73
+candidate page and the same m1 goals. If the arm wins, this gate stops being the navigation
+checkpoint and stays what it measurably is, the trigger for the one retry before the posterior
+takes over.
 
 ## Exit contract
 
